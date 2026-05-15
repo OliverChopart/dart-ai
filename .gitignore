@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+
+# ML models
+*.pt
+*.pth
+*.onnx
+runs/
+wandb/
+
+# Dataset
+dataset/images/
+dataset/cropped_images/
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+dist/
+
+# Logs
+logs/
+*.log
+
+# Calibration
+calibration.json
