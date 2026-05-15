@@ -1,0 +1,11 @@
+# DeepDarts dataset — converted for YOLOv11 detection training
+# Using standard detection format (not keypoint) for simplicity
+# Each dart tip is represented as a small bounding box
+path: dataset/yolo
+train: images/train
+val: images/val
+test: images/test
+
+nc: 1
+names:
+  0: dart
