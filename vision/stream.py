@@ -95,7 +95,14 @@ class VideoStream:
     # ------------------------------------------------------------------
 
     def _reader(self) -> None:
-        cap = cv2.VideoCapture(self._source)
+        # Use AVFoundation backend explicitly on macOS for integer sources —
+        # this ensures virtual webcams (Iriun, Camo, EpocCam) are found
+        # correctly instead of falling back to a wrong index.
+        if isinstance(self._source, int):
+            cap = cv2.VideoCapture(self._source, cv2.CAP_AVFOUNDATION)
+        else:
+            cap = cv2.VideoCapture(self._source)
+
         if not cap.isOpened():
             logger.error("failed to open camera", source=self._source)
             return
