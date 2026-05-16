@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-
+import cv2
 from utils.geometry import polar_to_segment
 from utils.logging import get_logger
 from vision.calibration import (
