@@ -29,10 +29,20 @@ class Settings(BaseSettings):
     camera_height: int = 720
     camera_fps: int = 30
 
-    # Vision
+    # Vision — YOLO model
+    # Update yolo_model_path to the 5-class model once trained:
+    #   models/dart_5class.pt
+    # Until then, the 1-class model can still be used with manual calibration.
     yolo_model_path: str = "models/yolo11n.pt"
-    detection_confidence: float = 0.5
+    yolo_num_classes: int = 5              # dart + cal_20 + cal_6 + cal_3 + cal_11
+    detection_confidence: float = 0.5      # minimum confidence for dart tips
+    yolo_cal_confidence: float = 0.4       # minimum confidence for cal points (lower = more recall)
     detection_device: str = "mps"
+
+    # Homography
+    homography_output_size: int = 800      # side length of canonical top-down board image
+    homography_fifo_size: int = 5          # sliding window length for FIFO debouncing
+    homography_fifo_min_hits: int = 3      # min frames a tip must appear in to be stable
 
     # Game
     max_players: int = 4
