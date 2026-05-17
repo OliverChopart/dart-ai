@@ -76,12 +76,7 @@ def check_own_images() -> bool:
 
 
 def merge_datasets(use_own: bool) -> Path:
-    """Merge McNally dataset with optional own images into MERGED_DIR.
-
-    Own images are always added to the train split only — they are too few
-    to split further, and keeping them in train maximises their impact on
-    learning your specific camera angle.
-    """
+    """Merge McNally dataset with optional own images into MERGED_DIR."""
     if MERGED_DIR.exists():
         shutil.rmtree(MERGED_DIR)
 
@@ -124,7 +119,6 @@ def merge_datasets(use_own: bool) -> Path:
 
         print(f"Own images added to train: {total_own}")
 
-    # Write merged dataset.yaml
     yaml = f"""# Merged dataset: McNally ({total_mcnally}) + own ({total_own})
 path: {MERGED_DIR.absolute()}
 train: images/train
@@ -146,21 +140,10 @@ names:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train 5-class dart detector")
-    parser.add_argument(
-        "--no-own",
-        action="store_true",
-        help="Train on McNally dataset only, skip own images",
-    )
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Check folder structure and exit without training",
-    )
+    parser.add_argument("--no-own", action="store_true", help="Skip own images")
+    parser.add_argument("--check", action="store_true", help="Check folder structure and exit")
     args = parser.parse_args()
 
-    # ------------------------------------------------------------------
-    # Sanity checks
-    # ------------------------------------------------------------------
     if not MCNALLY_DIR.exists() or not (MCNALLY_DIR / "dataset.yaml").exists():
         print("ERROR: McNally dataset not converted yet. Run first:")
         print("  uv run python scripts/convert_dataset_5class.py")
@@ -181,17 +164,10 @@ def main() -> None:
         print("Skipping own images (--no-own flag set)")
     elif not has_own:
         print(f"No own images found in {OWN_DIR} — training on McNally only")
-        print("To add your own images later, see the docstring at the top of this file")
 
-    # ------------------------------------------------------------------
-    # Merge datasets
-    # ------------------------------------------------------------------
     print("\nPreparing merged dataset...")
     dataset_yaml = merge_datasets(use_own=use_own)
 
-    # ------------------------------------------------------------------
-    # Train
-    # ------------------------------------------------------------------
     print("\nLoading base model...")
     model = YOLO("models/yolo11n.pt")
 
@@ -201,8 +177,8 @@ def main() -> None:
     model.train(
         data=str(dataset_yaml),
         epochs=100,
-        imgsz=640,          # 640 er hurtigere end 800 på MPS — god balance
-        batch=8,            # 8 er mere stabilt end 16 på Apple Silicon
+        imgsz=640,
+        batch=8,
         device="mps",
         project="runs/train",
         name="dart_5class",
@@ -211,8 +187,8 @@ def main() -> None:
         patience=20,
         lr0=0.001,
         warmup_epochs=3,
-        workers=0,          # 0 er bedst på macOS — undgår multiprocessing-fejl
-        cache=True,         # cache billeder i RAM efter første epoch
+        workers=0,
+        cache=False,        # cache slået fra — forårsagede FileNotFoundError
     )
 
     best = Path("runs/train/dart_5class/weights/best.pt")
