@@ -13,10 +13,10 @@ Workflow
        See README or run with --check to verify the folder structure.
 
 3. Train:
-       uv run python scripts/train_5class.py
+       caffeinate -i uv run python scripts/train_5class.py
 
    To train WITHOUT your own images (McNally only):
-       uv run python scripts/train_5class.py --no-own
+       caffeinate -i uv run python scripts/train_5class.py --no-own
 
 4. Update .env when done:
        YOLO_MODEL_PATH=runs/train/dart_5class/weights/best.pt
@@ -117,7 +117,6 @@ def merge_datasets(use_own: bool) -> Path:
                 continue
             dst_name = f"own_{img.name}"
             shutil.copy2(img, MERGED_DIR / "images" / "train" / dst_name)
-            # Roboflow label filename matches image filename with .txt extension
             lbl = own_lbls / img.with_suffix(".txt").name
             if lbl.exists():
                 shutil.copy2(lbl, MERGED_DIR / "labels" / "train" / f"own_{lbl.name}")
@@ -202,9 +201,9 @@ def main() -> None:
     model.train(
         data=str(dataset_yaml),
         epochs=100,
-        imgsz=800,
-        batch=16,
-        device="mps",       # change to 'cuda' on Linux/Windows with GPU
+        imgsz=640,          # 640 er hurtigere end 800 på MPS — god balance
+        batch=8,            # 8 er mere stabilt end 16 på Apple Silicon
+        device="mps",
         project="runs/train",
         name="dart_5class",
         save=True,
@@ -212,6 +211,8 @@ def main() -> None:
         patience=20,
         lr0=0.001,
         warmup_epochs=3,
+        workers=0,          # 0 er bedst på macOS — undgår multiprocessing-fejl
+        cache=True,         # cache billeder i RAM efter første epoch
     )
 
     best = Path("runs/train/dart_5class/weights/best.pt")
@@ -219,6 +220,8 @@ def main() -> None:
     print(f"Best model: {best}")
     print("\nUpdate .env:")
     print(f"  YOLO_MODEL_PATH={best}")
+    print("\nThen test:")
+    print("  uv run python scripts/test_detector.py --random")
     print("\nThen play:")
     print("  uv run python scripts/play_301.py")
 
