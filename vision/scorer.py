@@ -1,21 +1,28 @@
 """Dart score calculator.
 
-Takes a dart tip pixel coordinate from YOLO, transforms it to the canonical
-top-down board coordinate using the homography matrix, and returns the score.
+Converts YOLO dart tip detections to dart scores using either a dynamic
+homography (computed per-frame from calibration points) or a static
+homography loaded from disk.
 
 Pipeline::
 
     YOLO pixel (x, y)
-        -> apply_homography()       # perspective correction
+        -> perspectiveTransform(H)  # perspective correction
         -> normalise to [-1, 1]     # board centre = (0, 0), edge = +-1
         -> polar_to_segment()       # geometry -> score
         -> ScoreResult
 
-Usage::
+Preferred usage with 5-class model (dynamic homography)::
 
     scorer = DartScorer()
+    scorer.load()  # loads saved H if available, does not crash if missing
+    results = scorer.score_detections_with_homography(tips, H)
+
+Fallback usage with manual calibration (static homography)::
+
+    scorer = DartScorer()
+    scorer.load()  # requires config/homography.npy to exist
     result = scorer.score_pixel(x=462, y=118)
-    print(result.score, result.segment)  # e.g. 60  T20
 """
 
 from __future__ import annotations
@@ -23,8 +30,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import cv2
+import numpy as np
+
 from utils.geometry import polar_to_segment
 from utils.logging import get_logger
 from vision.calibration import (
@@ -60,9 +68,13 @@ class ScoreResult:
 class DartScorer:
     """Converts YOLO dart tip detections to dart scores.
 
-    Loads the homography matrix computed by the calibration tool and uses it
-    to transform raw pixel coordinates into normalised board coordinates before
-    applying polar geometry to determine the segment.
+    Supports two modes:
+    - Dynamic homography: pass H directly to score_detections_with_homography().
+      This is the preferred mode when using the 5-class YOLO model, as H is
+      recomputed on every frame from the detected calibration points.
+    - Static homography: call load() to read H from disk, then use
+      score_pixel() / score_detections(). Used as a fallback when a trained
+      5-class model is not yet available.
     """
 
     def __init__(
@@ -75,15 +87,91 @@ class DartScorer:
         self._homography_path = Path(homography_path)
 
     def load(self) -> "DartScorer":
-        """Load the homography matrix from disk."""
-        self._H = load_homography(self._homography_path)
-        logger.info("scorer ready", homography=str(self._homography_path))
+        """Attempt to load a saved homography matrix from disk.
+
+        Unlike the previous version this method does NOT raise FileNotFoundError
+        when the file is absent.  The pipeline will simply start without a
+        static H and rely on the per-frame homography from YOLO cal points.
+        """
+        if self._homography_path.exists():
+            try:
+                self._H = load_homography(self._homography_path)
+                logger.info("scorer ready with saved homography", path=str(self._homography_path))
+            except Exception as exc:
+                logger.warning("failed to load homography from disk", error=str(exc))
+        else:
+            logger.info(
+                "no saved homography found — awaiting dynamic calibration from YOLO",
+                path=str(self._homography_path),
+            )
         return self
 
     @property
     def is_ready(self) -> bool:
-        """True if the homography has been loaded."""
+        """True if a static homography has been loaded from disk."""
         return self._H is not None
+
+    # ------------------------------------------------------------------
+    # Dynamic homography (preferred with 5-class model)
+    # ------------------------------------------------------------------
+
+    def score_detections_with_homography(
+        self,
+        tips: list[tuple[float, float]],
+        H: np.ndarray,
+        confidences: list[float] | None = None,
+    ) -> list[ScoreResult]:
+        """Score dart tips using a dynamically computed homography matrix.
+
+        This is the preferred method when using the 5-class YOLO model.
+        H is recomputed each frame by compute_homography_from_detections()
+        in the pipeline, so the scoring adapts to any camera angle without
+        manual recalibration.
+
+        Args:
+            tips: List of (x, y) pixel coordinates from dart detections.
+            H: 3x3 homography matrix computed from the current frame's
+               calibration points.
+            confidences: Optional confidence scores, one per tip.
+
+        Returns:
+            List of ScoreResult, one per dart tip.
+        """
+        if confidences is None:
+            confidences = [1.0] * len(tips)
+
+        half = self._output_size / 2.0
+        results: list[ScoreResult] = []
+
+        for (px, py), conf in zip(tips, confidences):
+            bx, by = self._apply_homography(px, py, H)
+            nx = (bx - half) / half
+            ny = (by - half) / half
+            score, segment = polar_to_segment(nx, ny)
+            results.append(
+                ScoreResult(
+                    score=score,
+                    segment=segment,
+                    board_x=nx,
+                    board_y=ny,
+                    pixel_x=px,
+                    pixel_y=py,
+                    confidence=conf,
+                )
+            )
+            logger.debug(
+                "dart scored",
+                segment=segment,
+                score=score,
+                board_x=round(nx, 3),
+                board_y=round(ny, 3),
+            )
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Static homography (fallback / manual calibration)
+    # ------------------------------------------------------------------
 
     def score_pixel(
         self,
@@ -91,7 +179,7 @@ class DartScorer:
         y: float,
         confidence: float = 1.0,
     ) -> ScoreResult:
-        """Score a single dart tip given its pixel coordinate.
+        """Score a single dart tip using the static (disk-loaded) homography.
 
         Args:
             x: Pixel x coordinate in the original (uncorrected) frame.
@@ -100,45 +188,25 @@ class DartScorer:
 
         Returns:
             ScoreResult with score, segment and coordinate details.
+
+        Raises:
+            RuntimeError: If no homography has been loaded via load().
         """
         if self._H is None:
-            raise RuntimeError("Homography not loaded. Call scorer.load() first.")
-
-        # Transform pixel to corrected board coordinate
-        bx, by = self._pixel_to_board(x, y)
-
-        # Normalise: board centre = (0,0), board radius = 1.0
-        half = self._output_size / 2
-        nx = (bx - half) / half
-        ny = (by - half) / half
-
-        score, segment = polar_to_segment(nx, ny)
-
-        logger.debug(
-            "dart scored",
-            segment=segment,
-            score=score,
-            board_x=round(nx, 3),
-            board_y=round(ny, 3),
-            confidence=round(confidence, 2),
-        )
-
-        return ScoreResult(
-            score=score,
-            segment=segment,
-            board_x=nx,
-            board_y=ny,
-            pixel_x=x,
-            pixel_y=y,
-            confidence=confidence,
-        )
+            raise RuntimeError(
+                "Static homography not loaded. Call scorer.load() first, or use "
+                "score_detections_with_homography() with a dynamically computed H."
+            )
+        return self.score_detections_with_homography(
+            [(x, y)], self._H, [confidence]
+        )[0]
 
     def score_detections(
         self,
         tips: list[tuple[float, float]],
         confidences: list[float] | None = None,
     ) -> list[ScoreResult]:
-        """Score a list of dart tip detections from a single frame.
+        """Score a list of dart tips using the static (disk-loaded) homography.
 
         Args:
             tips: List of (x, y) pixel coordinates.
@@ -146,19 +214,24 @@ class DartScorer:
 
         Returns:
             List of ScoreResult, one per dart tip.
+
+        Raises:
+            RuntimeError: If no homography has been loaded via load().
         """
-        if confidences is None:
-            confidences = [1.0] * len(tips)
+        if self._H is None:
+            raise RuntimeError(
+                "Static homography not loaded. Call scorer.load() first, or use "
+                "score_detections_with_homography() with a dynamically computed H."
+            )
+        return self.score_detections_with_homography(tips, self._H, confidences)
 
-        return [
-            self.score_pixel(x, y, conf)
-            for (x, y), conf in zip(tips, confidences)
-        ]
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-    def _pixel_to_board(
-        self, px: float, py: float
-    ) -> tuple[float, float]:
-        """Apply homography to a single pixel coordinate."""
+    @staticmethod
+    def _apply_homography(px: float, py: float, H: np.ndarray) -> tuple[float, float]:
+        """Apply homography H to a single pixel coordinate."""
         pt = np.array([[[px, py]]], dtype=np.float32)
-        warped = cv2.perspectiveTransform(pt, self._H)
+        warped = cv2.perspectiveTransform(pt, H)
         return float(warped[0, 0, 0]), float(warped[0, 0, 1])
