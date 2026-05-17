@@ -47,6 +47,8 @@ MERGED_DIR = Path("dataset/yolo_5class_merged")
 
 SPLITS = ["train", "val", "test"]
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+
 
 def check_own_images() -> bool:
     """Return True if own images folder exists and contains annotated images."""
@@ -56,7 +58,7 @@ def check_own_images() -> bool:
     if not img_dir.exists():
         return False
 
-    images = list(img_dir.glob("*.jpg")) + list(img_dir.glob("*.JPG")) + list(img_dir.glob("*.png"))
+    images = [f for f in img_dir.iterdir() if f.suffix in IMAGE_EXTENSIONS]
     labels = list(lbl_dir.glob("*.txt")) if lbl_dir.exists() else []
 
     if images and labels:
@@ -95,6 +97,8 @@ def merge_datasets(use_own: bool) -> Path:
         if not src_imgs.exists():
             continue
         for img in src_imgs.iterdir():
+            if img.suffix not in IMAGE_EXTENSIONS:
+                continue
             shutil.copy2(img, MERGED_DIR / "images" / split / img.name)
             lbl = src_lbls / img.with_suffix(".txt").name
             if lbl.exists():
@@ -109,10 +113,11 @@ def merge_datasets(use_own: bool) -> Path:
         own_imgs = OWN_DIR / "images"
         own_lbls = OWN_DIR / "labels"
         for img in own_imgs.iterdir():
-            if img.suffix.lower() not in (".jpg", ".jpeg", ".png"):
+            if img.suffix not in IMAGE_EXTENSIONS:
                 continue
             dst_name = f"own_{img.name}"
             shutil.copy2(img, MERGED_DIR / "images" / "train" / dst_name)
+            # Roboflow label filename matches image filename with .txt extension
             lbl = own_lbls / img.with_suffix(".txt").name
             if lbl.exists():
                 shutil.copy2(lbl, MERGED_DIR / "labels" / "train" / f"own_{lbl.name}")
@@ -168,7 +173,7 @@ def main() -> None:
         print("\nMcNally dataset: OK" if MCNALLY_DIR.exists() else "\nMcNally dataset: MISSING")
         print(f"Own images:      {'OK' if has_own else 'not found (optional)'}")
         print(f"\nOwn images folder: {OWN_DIR}/")
-        print("  images/   <-- put your .jpg/.png files here")
+        print("  images/   <-- put your .jpg/.jpeg/.png files here")
         print("  labels/   <-- put Roboflow-exported .txt files here")
         return
 
