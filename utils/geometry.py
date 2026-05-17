@@ -11,7 +11,7 @@ RADIUS_BULL = 0.10
 RADIUS_TRIPLE_INNER = 0.60
 RADIUS_TRIPLE_OUTER = 0.68
 RADIUS_DOUBLE_INNER = 0.95
-RADIUS_DOUBLE_OUTER = 1.00
+RADIUS_DOUBLE_OUTER = 1.02  # slight margin above 1.0 to absorb float rounding at board edge
 
 
 def polar_to_segment(x: float, y: float) -> tuple[int, str]:
