@@ -16,9 +16,12 @@ __pycache__/
 runs/
 wandb/
 
-# Dataset
-dataset/images/
+# Dataset — exclude large image/label folders
+dataset/yolo/images/
+dataset/yolo/labels/
 dataset/cropped_images/
+dataset/images/
+dataset/my_board/
 
 # macOS
 .DS_Store
@@ -33,3 +36,13 @@ logs/
 
 # Calibration
 calibration.json
+
+# Debug images
+debug_roi.jpg
+detection_debug.jpg
+roi_for_calibration.jpg
+test_detection_output.jpg
+circle_detection*.jpg
+my_board*.jpg
+calibration_frame.jpg
+camera_test.jpg
