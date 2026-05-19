@@ -2,7 +2,7 @@
 
 Tastatur i kamera-vinduet:
   SPACE  — kalibrer (før kalibrering) / score pil (efter kalibrering)
-  ENTER  — ny tur (nulstiller pile-tæller, som når man fjerner pile fra skiven)
+  ENTER  — ny tur (nulstiller pile-tæller og kalder on_new_turn_callback)
   C      — rekalibrér
   Q      — afslut
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import math
 import threading
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -58,10 +58,12 @@ class DartPipeline:
     def __init__(
         self,
         on_score_callback: Callable[[ScoreEvent], None],
+        on_new_turn_callback: Optional[Callable[[], None]] = None,
         model_path: str | None = None,
         show_preview: bool = True,
     ) -> None:
         self._callback = on_score_callback
+        self._on_new_turn = on_new_turn_callback
         self._show_preview = show_preview
         self._running = False
         self._thread: threading.Thread | None = None
@@ -77,7 +79,6 @@ class DartPipeline:
         self._snapshot_requested: bool = False
         self._new_turn_requested: bool = False
 
-        # Antal pile scoret denne tur
         self._darts_scored: int = 0
 
         self._latest_preview: np.ndarray | None = None
@@ -110,16 +111,7 @@ class DartPipeline:
         logger.info("pipeline stopped")
 
     def tick_preview(self) -> bool:
-        """Vis seneste frame og håndtér tastatur. SKAL kaldes fra main thread.
-
-        Taster:
-          SPACE — kalibrer / score pil
-          ENTER — ny tur (fjern pile og nulstil tæller)
-          C     — rekalibrér
-          Q     — afslut
-
-        Returnerer False hvis brugeren trykker Q.
-        """
+        """Vis seneste frame og håndtér tastatur. SKAL kaldes fra main thread."""
         if not self._show_preview:
             return True
 
@@ -145,7 +137,7 @@ class DartPipeline:
         return True
 
     def reset_dart_count(self) -> None:
-        """Kald fra GameSession når ny tur startes via terminalen."""
+        """Nulstil pile-tæller (kaldes fra GameSession ved ny tur)."""
         self._darts_scored = 0
 
     def update_score_overlay(self, overlay: ScoreOverlay) -> None:
@@ -176,7 +168,10 @@ class DartPipeline:
             if self._new_turn_requested:
                 self._new_turn_requested = False
                 self._darts_scored = 0
-                print("\n🔄 Ny tur — pile-tæller nulstillet. Fjern pile og kast igen.")
+                print("\n🔄 Ny tur — fjern pile fra skiven og kast igen.")
+                # Kald session.new_turn() så hand-scores og overlay nulstilles
+                if self._on_new_turn:
+                    self._on_new_turn()
 
             # --- Kalibrering ---
             if self._calibration_requested:
@@ -225,7 +220,6 @@ class DartPipeline:
             )
             return
 
-        # Sorter pile stabilt efter afstand fra billedcentrum
         frame_cx = frame.shape[1] / 2
         frame_cy = frame.shape[0] / 2
         sorted_tips = sorted(
@@ -234,7 +228,6 @@ class DartPipeline:
         )
 
         new_tips = sorted_tips[self._darts_scored:]
-
         new_results = self._scorer.score_detections_with_homography(
             new_tips,
             self._homography,
