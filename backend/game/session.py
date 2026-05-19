@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from uuid import UUID
-
 from backend.game.game_301 import Game301, ThrowResult
 from backend.game.models import GameStatus
 from utils.logging import get_logger
@@ -36,7 +34,6 @@ class GameSession:
             model_path=model_path,
             show_preview=show_preview,
         )
-        # Track how many darts have been registered this turn
         self._throws_this_turn = 0
 
     def start(self) -> None:
@@ -67,16 +64,27 @@ class GameSession:
             player=self._game.state.current_player.display_name,
         )
 
+    def tick_preview(self) -> bool:
+        """Display the latest camera frame and handle keyboard input.
+
+        Must be called from the main thread on every loop iteration.
+        Returns False if the user pressed Q (quit).
+        """
+        return self._pipeline.tick_preview()
+
     @property
     def game(self) -> Game301:
         return self._game
+
+    @property
+    def pipeline(self) -> DartPipeline:
+        return self._pipeline
 
     def _on_score_event(self, event: ScoreEvent) -> None:
         """Called by pipeline when a new dart is detected."""
         if self._game.state.status != GameStatus.ACTIVE:
             return
 
-        # Register only the newest dart (highest index)
         new_dart_index = event.dart_count - 1
         if new_dart_index < 0 or new_dart_index >= len(event.results):
             return
