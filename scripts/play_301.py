@@ -4,9 +4,20 @@ Usage:
     uv run python scripts/play_301.py
     uv run python scripts/play_301.py --players "Alice" "Bob"
     uv run python scripts/play_301.py --players "Alice" "Bob" "Charlie" "Dave"
+
+Keyboard (in preview window):
+    SPACE  — kalibrer (skal gøres før spillet starter)
+    Q      — afslut
+
+Keyboard (i terminalen):
+    ENTER       — ny tur (fjern pile fra skiven)
+    u + ENTER   — fortryd sidste kast
+    s + ENTER   — vis scoreboard
+    q + ENTER   — afslut
 """
 
 import argparse
+import select
 import sys
 from pathlib import Path
 
@@ -32,6 +43,13 @@ def print_scoreboard(session: GameSession) -> None:
     print("\n" + session.game.scoreboard())
 
 
+def read_terminal_input() -> str | None:
+    """Non-blocking check for terminal input. Returns stripped line or None."""
+    if select.select([sys.stdin], [], [], 0)[0]:
+        return sys.stdin.readline().strip().lower()
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Spil 301 med live dart detection")
     parser.add_argument(
@@ -39,11 +57,6 @@ def main() -> None:
         nargs="+",
         default=["Spiller 1"],
         help="Spillernavne (1-4)",
-    )
-    parser.add_argument(
-        "--model",
-        default="runs/detect/runs/train/dart_25pct/weights/best.pt",
-        help="Sti til YOLO model",
     )
     parser.add_argument(
         "--no-preview",
@@ -56,8 +69,11 @@ def main() -> None:
     print("       DART-AI — 301")
     print("=" * 50)
     print(f"Spillere: {', '.join(args.players)}")
-    print(f"Model: {args.model}")
     print("=" * 50)
+    print("\nFør spillet starter:")
+    print("  1. Sørg for at hele dartskiven er synlig i kamera-vinduet")
+    print("  2. Tryk SPACE i kamera-vinduet for at kalibrere")
+    print("  3. Vent på '✅ Kalibrering lykkedes!' i terminalen")
     print("\nKommandoer under spillet:")
     print("  ENTER     — ny tur (fjern pile fra skiven)")
     print("  u + ENTER — fortryd sidste kast")
@@ -67,12 +83,11 @@ def main() -> None:
 
     session = GameSession(
         player_names=args.players,
-        model_path=args.model,
         show_preview=not args.no_preview,
         on_throw=on_throw,
     )
 
-    print(f"\nStarter kamera og indlæser model...")
+    print("\nStarter kamera og indlæser model...")
     session.start()
     print_scoreboard(session)
     print(f"\n{session.game.state.current_player.display_name} starter!")
@@ -80,7 +95,15 @@ def main() -> None:
 
     try:
         while session.game.state.status == GameStatus.ACTIVE:
-            cmd = input().strip().lower()
+            # Tick preview — must happen on main thread (macOS requirement)
+            # Returns False if user pressed Q in the preview window
+            if not session.pipeline.tick_preview():
+                break
+
+            # Non-blocking terminal input check
+            cmd = read_terminal_input()
+            if cmd is None:
+                continue
 
             if cmd == "q":
                 break
