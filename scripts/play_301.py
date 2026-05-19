@@ -5,8 +5,8 @@ Usage:
     uv run python scripts/play_301.py --players "Alice" "Bob"
     uv run python scripts/play_301.py --players "Alice" "Bob" "Charlie" "Dave"
 
-Keyboard (in preview window):
-    SPACE  — kalibrer (skal gøres før spillet starter)
+Keyboard (i preview-vinduet):
+    SPACE  — kalibrer (kan bruges når som helst)
     Q      — afslut
 
 Keyboard (i terminalen):
@@ -17,11 +17,15 @@ Keyboard (i terminalen):
 """
 
 import argparse
+import logging
 import select
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Slå debug/info logs fra — kun warnings og fejl vises i terminalen
+logging.basicConfig(level=logging.WARNING)
 
 from backend.game.game_301 import ThrowResult
 from backend.game.models import GameStatus
@@ -95,12 +99,11 @@ def main() -> None:
 
     try:
         while session.game.state.status == GameStatus.ACTIVE:
-            # Tick preview — must happen on main thread (macOS requirement)
-            # Returns False if user pressed Q in the preview window
-            if not session.pipeline.tick_preview():
+            # Tick preview — skal ske på main thread (macOS krav)
+            if not session.tick_preview():
                 break
 
-            # Non-blocking terminal input check
+            # Non-blocking terminal input
             cmd = read_terminal_input()
             if cmd is None:
                 continue
@@ -113,7 +116,6 @@ def main() -> None:
             elif cmd == "s":
                 print_scoreboard(session)
             elif cmd == "":
-                # New turn — darts removed from board
                 session.new_turn()
                 print(f"\n{session.game.state.current_player.display_name}s tur!")
                 print("Kast din første pil...")
