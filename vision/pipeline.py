@@ -43,7 +43,6 @@ from vision.stream import VideoStream
 
 logger = get_logger(__name__)
 
-# Minimum number of cal points needed to attempt homography
 MIN_CAL_POINTS = 1
 
 
@@ -55,6 +54,20 @@ class ScoreEvent:
     dart_count: int
     homography_source: str = "unknown"
     frame: np.ndarray | None = None
+
+
+@dataclass
+class ScoreOverlay:
+    """Score info passed from GameSession to pipeline for display in preview."""
+
+    player_name: str = ""
+    score_remaining: int = 0      # total score remaining e.g. 245
+    hand_scores: list[str] = None  # scores this hand e.g. ["T20", "5", "1"]
+    hand_total: int = 0            # sum this hand e.g. 66
+
+    def __post_init__(self):
+        if self.hand_scores is None:
+            self.hand_scores = []
 
 
 class DartPipeline:
@@ -86,6 +99,10 @@ class DartPipeline:
 
         # Calibration trigger
         self._calibration_requested: bool = False
+
+        # Score overlay — updated by GameSession after each throw
+        self._score_overlay: ScoreOverlay = ScoreOverlay()
+        self._overlay_lock = threading.Lock()
 
         # Latest frame for display — written by bg thread, read by main thread
         self._latest_preview: np.ndarray | None = None
@@ -147,6 +164,11 @@ class DartPipeline:
 
         return True
 
+    def update_score_overlay(self, overlay: ScoreOverlay) -> None:
+        """Update the score info shown in the preview. Thread-safe."""
+        with self._overlay_lock:
+            self._score_overlay = overlay
+
     def reset_dart_count(self) -> None:
         """Call this when darts are removed from the board (new turn)."""
         self._last_dart_count = 0
@@ -173,11 +195,7 @@ class DartPipeline:
             if frame is None:
                 continue
 
-            # Only run YOLO on calibration request or when already calibrated
-            if self._calibration_requested or self._homography is not None:
-                detection = self._detector.detect(frame, annotate=self._show_preview)
-            else:
-                detection = self._detector.detect(frame, annotate=self._show_preview)
+            detection = self._detector.detect(frame, annotate=self._show_preview)
 
             # Handle calibration request
             if self._calibration_requested:
@@ -192,10 +210,9 @@ class DartPipeline:
                     if H_new is not None:
                         self._homography = H_new
                         self._homography_source = "yolo"
-                        logger.info("calibration successful", cal_points=cal_count)
                         print(
                             f"\n✅ Kalibrering lykkedes! ({cal_count}/4 punkter fundet)"
-                            f"\n   {'God præcision' if cal_count == 4 else 'Delvis kalibrering — scorer kan være unøjagtige'}"
+                            + ("" if cal_count == 4 else "\n   ⚠️  Delvis kalibrering — scorer kan være unøjagtige")
                         )
                     else:
                         print("\n❌ Homografi-beregning fejlede — prøv igen med SPACE.")
@@ -213,27 +230,49 @@ class DartPipeline:
                     else frame.copy()
                 )
 
+                h, w = preview.shape[:2]
+
+                # --- Calibration status (top left) ---
                 cal_count = len(detection.cal_points)
                 if self._homography is not None:
-                    cal_text = f"Cal: OK [{self._homography_source}]  SPACE=rekalibrер"
+                    cal_text = f"Cal: OK [{self._homography_source}]"
                     cal_color = (0, 255, 0)
                 else:
-                    cal_text = f"Cal: {cal_count}/4 synlige — SPACE for at kalibrere"
+                    cal_text = f"Cal: {cal_count}/4 — SPACE for at kalibrere"
                     cal_color = (0, 165, 255) if cal_count > 0 else (0, 0, 255)
 
-                cv2.putText(
-                    preview, f"Pile: {len(detection.dart_tips)}",
-                    (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
-                )
-                cv2.putText(
-                    preview, cal_text,
-                    (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, cal_color, 2,
-                )
-                cv2.putText(
-                    preview, "SPACE = kalibrer  |  Q = afslut",
-                    (10, preview.shape[0] - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1,
-                )
+                cv2.putText(preview, cal_text, (10, 32),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, cal_color, 2)
+
+                # --- Score overlay (top right) ---
+                with self._overlay_lock:
+                    overlay = self._score_overlay
+
+                if overlay.player_name:
+                    # Player name
+                    name_text = overlay.player_name
+                    (tw, _), _ = cv2.getTextSize(name_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                    cv2.putText(preview, name_text, (w - tw - 10, 32),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+                    # Score remaining
+                    score_text = f"{overlay.score_remaining} tilbage"
+                    (tw, _), _ = cv2.getTextSize(score_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2)
+                    cv2.putText(preview, score_text, (w - tw - 10, 72),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
+
+                    # This hand
+                    if overlay.hand_scores:
+                        hand_text = "  +  ".join(overlay.hand_scores)
+                        if overlay.hand_total > 0:
+                            hand_text += f"  =  {overlay.hand_total}"
+                        (tw, _), _ = cv2.getTextSize(hand_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                        cv2.putText(preview, hand_text, (w - tw - 10, 108),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 100), 2)
+
+                # --- Bottom instruction ---
+                cv2.putText(preview, "SPACE = kalibrer  |  Q = afslut",
+                            (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
                 with self._preview_lock:
                     self._latest_preview = preview
