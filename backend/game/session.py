@@ -90,10 +90,9 @@ class GameSession:
     def _push_overlay(self) -> None:
         """Send current score info to the pipeline for display in preview."""
         player = self._game.state.current_player
-        remaining = player.score
         self._pipeline.update_score_overlay(ScoreOverlay(
             player_name=player.display_name,
-            score_remaining=remaining,
+            score_remaining=player.score_remaining,
             hand_scores=list(self._hand_scores),
             hand_total=self._hand_total,
         ))
