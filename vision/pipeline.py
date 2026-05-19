@@ -7,27 +7,17 @@ Calibration strategy
 --------------------
 On startup the pipeline shows a live camera feed but does NOT attempt
 calibration automatically.  The user must press SPACE in the preview window
-to trigger a calibration attempt.  This gives the user time to position
-the camera correctly before calibration is locked in.
+to trigger a calibration attempt.
 
-Once calibrated (Cal: OK shown in green) the homography is stored and
-reused for all subsequent frames.  Pressing SPACE again re-calibrates.
+Calibration requires minimum 1 cal point — the user can force calibration
+at any time by pressing SPACE, even with partial detection.  More points
+= more accurate homography.  4/4 is ideal, 3/4 is good, 1-2/4 is rough.
 
 macOS / OpenCV note
 -------------------
 cv2.imshow() must be called from the main thread on macOS.  The background
-inference thread therefore stores the latest annotated frame in
-self._latest_preview, and the caller (play_301.py) must call
-pipeline.tick_preview() in its main loop to actually display the window
-and handle keyboard events.
-
-Usage::
-
-    pipeline = DartPipeline(on_score_callback=on_score)
-    pipeline.start()
-    while running:
-        pipeline.tick_preview()   # call this from the main thread
-    pipeline.stop()
+inference thread stores the latest annotated frame in self._latest_preview,
+and the caller must call pipeline.tick_preview() in its main loop.
 """
 
 from __future__ import annotations
@@ -52,6 +42,9 @@ from vision.scorer import DartScorer, ScoreResult
 from vision.stream import VideoStream
 
 logger = get_logger(__name__)
+
+# Minimum number of cal points needed to attempt homography
+MIN_CAL_POINTS = 1
 
 
 @dataclass
@@ -91,7 +84,7 @@ class DartPipeline:
         self._homography: np.ndarray | None = None
         self._homography_source: str = "none"
 
-        # Calibration trigger — set from main thread, consumed in bg thread
+        # Calibration trigger
         self._calibration_requested: bool = False
 
         # Latest frame for display — written by bg thread, read by main thread
@@ -135,8 +128,7 @@ class DartPipeline:
     def tick_preview(self) -> bool:
         """Display the latest frame and handle keyboard input.
 
-        Must be called from the MAIN THREAD on every iteration of the
-        caller's loop.  Returns False if the user pressed Q (quit).
+        Must be called from the MAIN THREAD. Returns False if user pressed Q.
         """
         if not self._show_preview:
             return True
@@ -150,7 +142,6 @@ class DartPipeline:
         key = cv2.waitKey(1) & 0xFF
         if key == ord(" "):
             self._calibration_requested = True
-            logger.info("calibration requested by user")
         elif key == ord("q"):
             return False
 
@@ -162,7 +153,6 @@ class DartPipeline:
         self._debounce_counter = 0
         self._pending_count = 0
         self._dart_fifo.clear()
-        logger.info("dart count reset")
 
     @property
     def has_homography(self) -> bool:
@@ -183,12 +173,18 @@ class DartPipeline:
             if frame is None:
                 continue
 
-            detection = self._detector.detect(frame, annotate=self._show_preview)
+            # Only run YOLO on calibration request or when already calibrated
+            if self._calibration_requested or self._homography is not None:
+                detection = self._detector.detect(frame, annotate=self._show_preview)
+            else:
+                detection = self._detector.detect(frame, annotate=self._show_preview)
 
             # Handle calibration request
             if self._calibration_requested:
                 self._calibration_requested = False
-                if detection.has_full_calibration:
+                cal_count = len(detection.cal_points)
+
+                if cal_count >= MIN_CAL_POINTS:
                     H_new = compute_homography_from_detections(
                         detection.cal_points,
                         output_size=settings.homography_output_size,
@@ -196,19 +192,20 @@ class DartPipeline:
                     if H_new is not None:
                         self._homography = H_new
                         self._homography_source = "yolo"
-                        logger.info("calibration successful")
-                        print("\n✅ Kalibrering lykkedes! Tryk ENTER for at starte spillet.")
+                        logger.info("calibration successful", cal_points=cal_count)
+                        print(
+                            f"\n✅ Kalibrering lykkedes! ({cal_count}/4 punkter fundet)"
+                            f"\n   {'God præcision' if cal_count == 4 else 'Delvis kalibrering — scorer kan være unøjagtige'}"
+                        )
                     else:
-                        print("\n❌ Kalibrering fejlede — prøv igen med SPACE.")
+                        print("\n❌ Homografi-beregning fejlede — prøv igen med SPACE.")
                 else:
-                    missing = [s for s in (20, 6, 3, 11) if s not in detection.cal_points]
                     print(
-                        f"\n❌ Kalibrering fejlede — {len(detection.cal_points)}/4 punkter fundet."
-                        f"\n   Mangler: cal_{'  cal_'.join(str(s) for s in missing)}"
-                        f"\n   Sørg for at hele dartskiven er synlig og tryk SPACE igen."
+                        "\n❌ Ingen kalibreringspunkter fundet."
+                        "\n   Sørg for at dartskiven er synlig og prøv igen med SPACE."
                     )
 
-            # Build preview frame (written here, displayed in main thread)
+            # Build preview frame
             if self._show_preview:
                 preview = (
                     detection.annotated_frame.copy()
@@ -218,24 +215,22 @@ class DartPipeline:
 
                 cal_count = len(detection.cal_points)
                 if self._homography is not None:
-                    cal_text = f"Cal: OK [{self._homography_source}]"
+                    cal_text = f"Cal: OK [{self._homography_source}]  SPACE=rekalibrер"
                     cal_color = (0, 255, 0)
                 else:
-                    cal_text = f"Cal: {cal_count}/4 — tryk SPACE for at kalibrere"
+                    cal_text = f"Cal: {cal_count}/4 synlige — SPACE for at kalibrere"
                     cal_color = (0, 165, 255) if cal_count > 0 else (0, 0, 255)
 
-                dart_count_display = len(detection.dart_tips)
                 cv2.putText(
-                    preview, f"Pile: {dart_count_display}",
+                    preview, f"Pile: {len(detection.dart_tips)}",
                     (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
                 )
                 cv2.putText(
                     preview, cal_text,
-                    (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.7, cal_color, 2,
+                    (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.6, cal_color, 2,
                 )
-                instruction = "SPACE = kalibrer  |  Q = afslut"
                 cv2.putText(
-                    preview, instruction,
+                    preview, "SPACE = kalibrer  |  Q = afslut",
                     (10, preview.shape[0] - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1,
                 )
