@@ -60,30 +60,23 @@ class DartDetection:
 
     # Calibration points detected by YOLO.
     # Key = dartboard segment number (20, 6, 3, 11).
-    # Value = (x, y) pixel coordinate of the upper-left corner of the double ring.
+    # Value = (x, y) pixel coordinate — best confidence detection per class.
     cal_points: dict[int, tuple[float, float]] = field(default_factory=dict)
 
-    board_bbox: Optional[tuple[int, int, int, int]] = None  # kept for HoughCircles fallback
+    board_bbox: Optional[tuple[int, int, int, int]] = None
     annotated_frame: Optional[np.ndarray] = None
 
     @property
     def has_calibration(self) -> bool:
-        """True if at least one calibration point was detected."""
         return len(self.cal_points) >= 1
 
     @property
     def has_full_calibration(self) -> bool:
-        """True if all four calibration points were detected."""
         return all(k in self.cal_points for k in (20, 6, 3, 11))
 
 
 class DartDetector:
-    """Wraps YOLOv8/v11 for dart tip and calibration point detection.
-
-    With the 5-class model the detector separates dart tips from the four
-    calibration corner classes so that the pipeline can compute a fresh
-    homography matrix on every frame without manual intervention.
-    """
+    """Wraps YOLOv8/v11 for dart tip and calibration point detection."""
 
     def __init__(self, model_path: Optional[str] = None) -> None:
         self._model_path = model_path or settings.yolo_model_path
@@ -92,7 +85,6 @@ class DartDetector:
         logger.info("detector initialised", model=self._model_path, device=self._device)
 
     def load(self) -> "DartDetector":
-        """Load the YOLO model into memory."""
         if not Path(self._model_path).exists():
             raise FileNotFoundError(
                 f"Model not found: {self._model_path}. "
@@ -108,17 +100,11 @@ class DartDetector:
     def detect(self, frame: np.ndarray, annotate: bool = True) -> DartDetection:
         """Run detection on a single frame.
 
-        Boxes with class 0 (dart) are collected as dart tips.
-        Boxes with classes 1-4 (cal_20, cal_6, cal_3, cal_11) are collected
-        as calibration points using the upper-left corner of their bounding box.
+        For calibration points: if YOLO detects the same class multiple times
+        (e.g. two cal_11 boxes), only the one with the highest confidence is
+        kept. This prevents double-detections from blocking calibration.
 
-        Args:
-            frame: BGR numpy array from OpenCV.
-            annotate: If True, draw bounding boxes on a copy of the frame.
-
-        Returns:
-            DartDetection with dart tips, calibration points, and optional
-            annotated frame.
+        For dart tips: all detections above the confidence threshold are kept.
         """
         if self._model is None:
             raise RuntimeError("Model not loaded. Call detector.load() first.")
@@ -131,8 +117,11 @@ class DartDetector:
 
         dart_tips: list[tuple[float, float]] = []
         confidences: list[float] = []
-        cal_points: dict[int, tuple[float, float]] = {}
-        board_bbox: Optional[tuple[int, int, int, int]] = None
+
+        # Track best confidence per cal segment to handle duplicate detections
+        # Key = segment number, Value = (confidence, x, y)
+        cal_best: dict[int, tuple[float, float, float]] = {}
+
         annotated_frame = None
 
         for result in results:
@@ -146,21 +135,25 @@ class DartDetector:
                 cls = int(box.cls[0])
 
                 if cls == CLASS_DART:
-                    # Use bounding box centre as dart tip coordinate
                     cx = (x1 + x2) / 2
                     cy = (y1 + y2) / 2
                     dart_tips.append((cx, cy))
                     confidences.append(conf)
 
                 elif cls in CAL_CLASS_TO_SEGMENT:
-                    # Use upper-left corner of bbox as the calibration point.
-                    # This matches dart-sense's convention: the corner of the
-                    # double-ring segment, not its centre.
                     segment = CAL_CLASS_TO_SEGMENT[cls]
-                    cal_points[segment] = (x1, y1)
+                    # Keep only the highest-confidence detection per segment
+                    if segment not in cal_best or conf > cal_best[segment][0]:
+                        cal_best[segment] = (conf, x1, y1)
 
             if annotate:
                 annotated_frame = result.plot()
+
+        # Convert cal_best to cal_points
+        cal_points = {
+            segment: (x, y)
+            for segment, (conf, x, y) in cal_best.items()
+        }
 
         logger.debug(
             "detection complete",
@@ -173,20 +166,10 @@ class DartDetector:
             dart_tips=dart_tips,
             confidences=confidences,
             cal_points=cal_points,
-            board_bbox=board_bbox,
             annotated_frame=annotated_frame,
         )
 
     def detect_from_file(self, image_path: str, annotate: bool = True) -> DartDetection:
-        """Run detection on an image file.
-
-        Args:
-            image_path: Path to a JPG/PNG image.
-            annotate: If True, draw bounding boxes on the result.
-
-        Returns:
-            DartDetection result.
-        """
         frame = cv2.imread(image_path)
         if frame is None:
             raise FileNotFoundError(f"Could not read image: {image_path}")
@@ -194,7 +177,6 @@ class DartDetector:
 
     @staticmethod
     def _select_device(preferred: str) -> str:
-        """Select best available compute device."""
         if preferred == "mps" and torch.backends.mps.is_available():
             return "mps"
         if preferred == "cuda" and torch.cuda.is_available():
