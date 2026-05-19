@@ -1,9 +1,10 @@
 """Live dart detection pipeline.
 
 Tastatur i kamera-vinduet:
-  SPACE  — kalibrer (før kalibrering) / score pil (efter kalibrering)
-  ENTER  — ny tur (nulstiller pile-tæller og kalder on_new_turn_callback)
+  SPACE  — score pil
+  K      — kalibrer (første gang)
   C      — rekalibrér
+  ENTER  — ny tur
   Q      — afslut
 
 macOS note: cv2.imshow() skal kaldes fra main thread — tick_preview() håndterer dette.
@@ -111,7 +112,15 @@ class DartPipeline:
         logger.info("pipeline stopped")
 
     def tick_preview(self) -> bool:
-        """Vis seneste frame og håndtér tastatur. SKAL kaldes fra main thread."""
+        """Vis seneste frame og håndtér tastatur. SKAL kaldes fra main thread.
+
+        Taster:
+          SPACE — score pil
+          K     — kalibrer
+          C     — rekalibrér
+          ENTER — ny tur
+          Q     — afslut
+        """
         if not self._show_preview:
             return True
 
@@ -123,21 +132,19 @@ class DartPipeline:
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord(" "):
-            if self._homography is None:
-                self._calibration_requested = True
-            else:
-                self._snapshot_requested = True
+            self._snapshot_requested = True
+        elif key in (ord("k"), ord("K")):
+            self._calibration_requested = True
+        elif key in (ord("c"), ord("C")):
+            self._calibration_requested = True
         elif key in (13, 10):  # ENTER
             self._new_turn_requested = True
-        elif key == ord("c"):
-            self._calibration_requested = True
         elif key == ord("q"):
             return False
 
         return True
 
     def reset_dart_count(self) -> None:
-        """Nulstil pile-tæller (kaldes fra GameSession ved ny tur)."""
         self._darts_scored = 0
 
     def update_score_overlay(self, overlay: ScoreOverlay) -> None:
@@ -164,12 +171,11 @@ class DartPipeline:
 
             detection = self._detector.detect(frame, annotate=self._show_preview)
 
-            # --- Ny tur (ENTER i kamera-vinduet) ---
+            # --- Ny tur ---
             if self._new_turn_requested:
                 self._new_turn_requested = False
                 self._darts_scored = 0
                 print("\n🔄 Ny tur — fjern pile fra skiven og kast igen.")
-                # Kald session.new_turn() så hand-scores og overlay nulstilles
                 if self._on_new_turn:
                     self._on_new_turn()
 
@@ -180,7 +186,7 @@ class DartPipeline:
                 if cal_count < MIN_HOMOGRAPHY_POINTS:
                     print(
                         f"\n❌ Kalibrering fejlede — {cal_count}/4 punkter fundet."
-                        f"\n   Sørg for at hele skiven er synlig og prøv igen."
+                        f"\n   Sørg for at hele skiven er synlig og prøv igen (K)."
                     )
                 else:
                     H_new = compute_homography_from_detections(
@@ -193,12 +199,15 @@ class DartPipeline:
                         self._darts_scored = 0
                         print("\n✅ Kalibrering lykkedes! Kast en pil og tryk SPACE.")
                     else:
-                        print("\n❌ Homografi-beregning fejlede — prøv igen.")
+                        print("\n❌ Homografi-beregning fejlede — prøv igen (K).")
 
             # --- Snapshot scoring ---
             if self._snapshot_requested and self._homography is not None:
                 self._snapshot_requested = False
                 self._score_snapshot(frame, detection)
+            elif self._snapshot_requested and self._homography is None:
+                self._snapshot_requested = False
+                print("\n⚠️  Ikke kalibreret endnu — tryk K for at kalibrere først.")
 
             # --- Preview ---
             if self._show_preview:
@@ -216,7 +225,7 @@ class DartPipeline:
         if total <= self._darts_scored:
             print(
                 f"⚠️  Ikke flere pile end sidst ({total} <= {self._darts_scored})."
-                f"\n   Tryk ENTER i kamera-vinduet for at starte ny tur."
+                f"\n   Tryk ENTER for ny tur."
             )
             return
 
@@ -260,15 +269,15 @@ class DartPipeline:
         if self._homography is not None:
             cal_text = f"Cal: OK [{self._homography_source}]"
             cal_color = (0, 255, 0)
-            instruction = "SPACE=score  ENTER=ny tur  C=kalibrér  Q=afslut"
+            instruction = "SPACE=score  ENTER=ny tur  K/C=kalibrér  Q=afslut"
         else:
             if cal_count >= MIN_HOMOGRAPHY_POINTS:
-                cal_text = f"Cal: {cal_count}/4 klar — SPACE for at kalibrere"
+                cal_text = f"Cal: {cal_count}/4 klar — tryk K for at kalibrere"
                 cal_color = (0, 255, 165)
             else:
                 cal_text = f"Cal: {cal_count}/4 — mangler {MIN_HOMOGRAPHY_POINTS - cal_count} punkt(er)"
                 cal_color = (0, 165, 255) if cal_count > 0 else (0, 0, 255)
-            instruction = "SPACE=kalibrér (kræver 4/4)  Q=afslut"
+            instruction = "K=kalibrér (kræver 4/4)  Q=afslut"
 
         cv2.putText(preview, cal_text, (10, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, cal_color, 2)
