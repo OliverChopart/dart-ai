@@ -5,11 +5,13 @@ via homography, and emits ScoreEvents to a callback.
 
 Calibration strategy
 --------------------
-With the 5-class YOLO model the pipeline recomputes the homography on every
-frame where all four calibration points (cal_20, cal_6, cal_3, cal_11) are
-detected.  If only a subset is visible the last known homography is reused.
-If no homography has ever been computed the pipeline falls back to a matrix
-loaded from disk (config/homography.npy) produced by run_calibration.py.
+On startup the pipeline shows a live camera feed but does NOT attempt
+calibration automatically.  The user must press SPACE in the preview window
+to trigger a calibration attempt.  This gives the user time to position
+the camera correctly before calibration is locked in.
+
+Once calibrated (Cal: 4/4 shown in green) the homography is stored and
+reused for all subsequent frames.  Pressing SPACE again re-calibrates.
 
 FIFO debouncing
 ---------------
@@ -25,6 +27,7 @@ Usage::
 
     pipeline = DartPipeline(on_score_callback=on_score)
     pipeline.start()
+    # ... press SPACE in the preview window to calibrate ...
     # ... play darts ...
     pipeline.stop()
 """
@@ -34,7 +37,7 @@ from __future__ import annotations
 import math
 import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 import cv2
@@ -43,7 +46,6 @@ import numpy as np
 from config.settings import settings
 from utils.logging import get_logger
 from vision.calibration import (
-    DEFAULT_HOMOGRAPHY_PATH,
     DEFAULT_OUTPUT_SIZE,
     compute_homography_from_detections,
 )
@@ -69,16 +71,15 @@ class DartPipeline:
 
     Runs inference in a background thread.  Calls on_score_callback whenever
     the number of stably-detected darts increases (new dart thrown).
+
+    Calibration is manual: press SPACE in the preview window to trigger a
+    calibration attempt from the current frame.
     """
 
-    # Debounce: how many consecutive frames must show the same dart count
-    # before emitting a score event
     DEBOUNCE_FRAMES: int = 8
-
-    # FIFO: sliding window size and minimum hit count for dart tip stability
     FIFO_SIZE: int = 5
     FIFO_MIN_HITS: int = 3
-    FIFO_TOLERANCE: float = 15.0  # pixels — max distance between matched tips
+    FIFO_TOLERANCE: float = 15.0
 
     def __init__(
         self,
@@ -99,7 +100,10 @@ class DartPipeline:
         self._homography: np.ndarray | None = None
         self._homography_source: str = "none"
 
-        # FIFO queue: each entry is the list of dart tips detected in one frame
+        # Calibration: only attempt when user presses SPACE
+        self._calibration_requested: bool = False
+
+        # FIFO queue
         self._dart_fifo: deque[list[tuple[float, float]]] = deque(maxlen=self.FIFO_SIZE)
 
         # Debounce state
@@ -116,21 +120,13 @@ class DartPipeline:
         """Load models and start the pipeline thread."""
         logger.info("loading models...")
         self._detector.load()
-        self._scorer.load()  # soft load — does not crash if homography.npy absent
-
-        # Use saved static homography as initial fallback
-        if self._scorer.is_ready:
-            self._homography = np.load(str(DEFAULT_HOMOGRAPHY_PATH))
-            self._homography_source = "disk"
-            logger.info("initial homography loaded from disk")
-        else:
-            logger.info("no saved homography — will calibrate automatically from YOLO")
+        self._scorer.load()
 
         self._stream.start()
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        logger.info("pipeline started")
+        logger.info("pipeline started — press SPACE in preview window to calibrate")
 
     def stop(self) -> None:
         """Stop the pipeline and release resources."""
@@ -149,14 +145,17 @@ class DartPipeline:
         self._dart_fifo.clear()
         logger.info("dart count reset")
 
+    def request_calibration(self) -> None:
+        """Request a calibration attempt on the next frame (thread-safe)."""
+        self._calibration_requested = True
+        logger.info("calibration requested")
+
     @property
     def has_homography(self) -> bool:
-        """True if a homography matrix is available (from YOLO or disk)."""
         return self._homography is not None
 
     @property
     def homography_source(self) -> str:
-        """Where the current homography came from: 'yolo', 'disk', or 'none'."""
         return self._homography_source
 
     # ------------------------------------------------------------------
@@ -170,29 +169,88 @@ class DartPipeline:
             if frame is None:
                 continue
 
-            # 1. Run YOLO detection (darts + calibration points)
+            # Always run YOLO so we can show detections in the preview
             detection = self._detector.detect(frame, annotate=self._show_preview)
 
-            # 2. Update homography from YOLO calibration points when available
-            if detection.has_full_calibration:
-                H_new = compute_homography_from_detections(
-                    detection.cal_points,
-                    output_size=settings.homography_output_size,
-                )
-                if H_new is not None:
-                    self._homography = H_new
-                    self._homography_source = "yolo"
+            # Only attempt calibration when SPACE has been pressed
+            if self._calibration_requested:
+                self._calibration_requested = False
+                if detection.has_full_calibration:
+                    H_new = compute_homography_from_detections(
+                        detection.cal_points,
+                        output_size=settings.homography_output_size,
+                    )
+                    if H_new is not None:
+                        self._homography = H_new
+                        self._homography_source = "yolo"
+                        logger.info("calibration successful — homography updated")
+                        print("\n✅ Kalibrering lykkedes! Alle 4 kalibreringspunkter fundet.")
+                    else:
+                        logger.warning("calibration failed — findHomography returned None")
+                        print("\n❌ Kalibrering fejlede — prøv igen med SPACE.")
+                else:
+                    missing = [s for s in (20, 6, 3, 11) if s not in detection.cal_points]
+                    logger.warning("calibration failed — missing cal points", missing=missing)
+                    print(
+                        f"\n❌ Kalibrering fejlede — kun {len(detection.cal_points)}/4 punkter fundet."
+                        f" Mangler: cal_{', cal_'.join(str(s) for s in missing)}"
+                        f"\n   Sørg for at hele dartskiven er synlig og tryk SPACE igen."
+                    )
 
+            # Show preview — always, even before calibration
+            if self._show_preview:
+                preview = (
+                    detection.annotated_frame.copy()
+                    if detection.annotated_frame is not None
+                    else frame.copy()
+                )
+
+                # Calibration status
+                cal_count = len(detection.cal_points)
+                if self._homography is not None:
+                    cal_text = f"Cal: OK [{self._homography_source}]"
+                    cal_color = (0, 255, 0)
+                else:
+                    cal_text = f"Cal: {cal_count}/4 — tryk SPACE for at kalibrere"
+                    cal_color = (0, 165, 255) if cal_count > 0 else (0, 0, 255)
+
+                dart_count = len(detection.dart_tips)
+                cv2.putText(
+                    preview, f"Pile: {dart_count}",
+                    (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
+                )
+                cv2.putText(
+                    preview, cal_text,
+                    (10, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.7, cal_color, 2,
+                )
+
+                # Instruction overlay at the bottom
+                if self._homography is None:
+                    instruction = "SPACE = kalibrer  |  Q = afslut"
+                else:
+                    instruction = "SPACE = rekalibrер  |  Q = afslut"
+                cv2.putText(
+                    preview, instruction,
+                    (10, preview.shape[0] - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1,
+                )
+
+                cv2.imshow("Dart-AI", preview)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord(" "):
+                    self.request_calibration()
+                elif key == ord("q"):
+                    self._running = False
+
+            # Skip scoring until calibrated
             if self._homography is None:
-                # No homography available yet — keep buffering frames
-                logger.debug("waiting for calibration points...")
                 continue
 
-            # 3. FIFO debounce: only keep tips stable across multiple frames
+            # FIFO debounce
             stable_tips = self._fifo_filter(detection.dart_tips)
-            stable_confs = [1.0] * len(stable_tips)  # FIFO doesn't preserve conf
+            stable_confs = [1.0] * len(stable_tips)
 
-            # 4. Score stable dart tips
+            # Score
             results = self._scorer.score_detections_with_homography(
                 stable_tips,
                 self._homography,
@@ -201,7 +259,7 @@ class DartPipeline:
 
             dart_count = len(results)
 
-            # 5. Emit score event when dart count increases and is stable
+            # Emit score event when dart count increases and is stable
             if dart_count != self._last_dart_count:
                 if dart_count == self._pending_count:
                     self._debounce_counter += 1
@@ -222,26 +280,6 @@ class DartPipeline:
                     self._last_dart_count = dart_count
                     self._debounce_counter = 0
 
-            # 6. Show preview with calibration status overlay
-            if self._show_preview and detection.annotated_frame is not None:
-                preview = detection.annotated_frame.copy()
-                cal_status = (
-                    f"Cal: {len(detection.cal_points)}/4 "
-                    f"[{self._homography_source}]"
-                )
-                color = (0, 255, 0) if detection.has_full_calibration else (0, 165, 255)
-                cv2.putText(
-                    preview, f"Pile: {dart_count}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
-                )
-                cv2.putText(
-                    preview, cal_status,
-                    (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2,
-                )
-                cv2.imshow("Dart-AI", preview)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    self._running = False
-
     # ------------------------------------------------------------------
     # FIFO debounce filter
     # ------------------------------------------------------------------
@@ -250,18 +288,7 @@ class DartPipeline:
         self,
         tips: list[tuple[float, float]],
     ) -> list[tuple[float, float]]:
-        """Return only dart tips that appear stably across the FIFO window.
-
-        A tip is considered stable if a matching tip (within FIFO_TOLERANCE
-        pixels) was present in at least FIFO_MIN_HITS of the last FIFO_SIZE
-        frames.  This eliminates single-frame noise and false positives.
-
-        Args:
-            tips: Dart tips detected in the current frame.
-
-        Returns:
-            Filtered list of stable dart tip coordinates.
-        """
+        """Return only dart tips stable across the FIFO window."""
         self._dart_fifo.append(tips)
 
         if len(self._dart_fifo) < self.FIFO_MIN_HITS:
