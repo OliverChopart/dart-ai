@@ -15,11 +15,6 @@ Scoring is MANUAL and per-dart:
 Pressing SPACE before calibration triggers calibration instead.
 Pressing C at any time re-calibrates.
 
-This design means:
-- The board can have 1, 2, or 3 darts in it at any time
-- Each SPACE press scores only the dart that was just thrown
-- No automatic detection — zero false positives
-
 macOS / OpenCV note
 -------------------
 cv2.imshow() must be called from the main thread on macOS. The background
@@ -41,6 +36,7 @@ from config.settings import settings
 from utils.logging import get_logger
 from vision.calibration import (
     DEFAULT_OUTPUT_SIZE,
+    MIN_HOMOGRAPHY_POINTS,
     compute_homography_from_detections,
 )
 from vision.detector import DartDetector
@@ -49,15 +45,13 @@ from vision.stream import VideoStream
 
 logger = get_logger(__name__)
 
-MIN_CAL_POINTS = 1
-
 
 @dataclass
 class ScoreEvent:
     """Emitted when the user presses SPACE after throwing a dart."""
 
-    results: list[ScoreResult]       # only the NEW dart(s) since last snapshot
-    dart_count: int                  # total darts on board right now
+    results: list[ScoreResult]
+    dart_count: int
     homography_source: str = "unknown"
     frame: np.ndarray | None = None
 
@@ -77,14 +71,8 @@ class ScoreOverlay:
 
 
 class DartPipeline:
-    """Ties together VideoStream -> YOLO -> per-dart snapshot scoring.
+    """Ties together VideoStream -> YOLO -> per-dart snapshot scoring."""
 
-    The user presses SPACE to score the dart they just threw. The pipeline
-    remembers which darts were already scored and only emits new ones.
-    Pressing ENTER (new_turn) resets the memory so the next turn starts fresh.
-    """
-
-    # Position tolerance for matching darts across snapshots (pixels)
     MATCH_TOLERANCE: float = 40.0
 
     def __init__(
@@ -102,22 +90,17 @@ class DartPipeline:
         self._detector = DartDetector(model_path=model_path)
         self._scorer = DartScorer()
 
-        # Homography state
         self._homography: np.ndarray | None = None
         self._homography_source: str = "none"
 
-        # Triggers set from main thread, consumed in bg thread
         self._calibration_requested: bool = False
         self._snapshot_requested: bool = False
 
-        # Memory: positions of darts already scored this turn
         self._scored_tips: list[tuple[float, float]] = []
 
-        # Latest frame for display
         self._latest_preview: np.ndarray | None = None
         self._preview_lock = threading.Lock()
 
-        # Score overlay
         self._score_overlay: ScoreOverlay = ScoreOverlay()
         self._overlay_lock = threading.Lock()
 
@@ -126,7 +109,6 @@ class DartPipeline:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Load models and start the background inference thread."""
         logger.info("loading models...")
         self._detector.load()
         self._scorer.load()
@@ -137,7 +119,6 @@ class DartPipeline:
         logger.info("pipeline started")
 
     def stop(self) -> None:
-        """Stop the pipeline and release resources."""
         self._running = False
         self._stream.stop()
         if self._thread:
@@ -148,13 +129,7 @@ class DartPipeline:
 
     def tick_preview(self) -> bool:
         """Display the latest frame and handle keyboard input.
-
         Must be called from the MAIN THREAD. Returns False if user pressed Q.
-
-        Keys:
-            SPACE — calibrate (before calibration) or score snapshot (after)
-            C     — re-calibrate at any time
-            Q     — quit
         """
         if not self._show_preview:
             return True
@@ -179,14 +154,10 @@ class DartPipeline:
         return True
 
     def reset_dart_count(self) -> None:
-        """Call when darts are removed from the board (new turn).
-        Clears the scored-dart memory so the next turn starts fresh.
-        """
+        """Call when darts are removed from the board (new turn)."""
         self._scored_tips = []
-        logger.info("dart memory reset for new turn")
 
     def update_score_overlay(self, overlay: ScoreOverlay) -> None:
-        """Update the score info shown in the preview. Thread-safe."""
         with self._overlay_lock:
             self._score_overlay = overlay
 
@@ -203,7 +174,6 @@ class DartPipeline:
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        """Main inference loop — runs in a daemon thread."""
         while self._running:
             frame = self._stream.read(timeout=0.5)
             if frame is None:
@@ -215,7 +185,13 @@ class DartPipeline:
             if self._calibration_requested:
                 self._calibration_requested = False
                 cal_count = len(detection.cal_points)
-                if cal_count >= MIN_CAL_POINTS:
+
+                if cal_count < MIN_HOMOGRAPHY_POINTS:
+                    print(
+                        f"\n❌ Kalibrering fejlede — kun {cal_count}/4 punkter fundet."
+                        f"\n   Homografi kræver præcist 4 punkter. Prøv igen med SPACE."
+                    )
+                else:
                     H_new = compute_homography_from_detections(
                         detection.cal_points,
                         output_size=settings.homography_output_size,
@@ -223,15 +199,10 @@ class DartPipeline:
                     if H_new is not None:
                         self._homography = H_new
                         self._homography_source = "yolo"
-                        self._scored_tips = []  # reset memory on recalibration
-                        print(
-                            f"\n✅ Kalibrering lykkedes! ({cal_count}/4 punkter)"
-                            + ("" if cal_count == 4 else "\n   ⚠️  Delvis kalibrering")
-                        )
+                        self._scored_tips = []
+                        print(f"\n✅ Kalibrering lykkedes! (4/4 punkter fundet)")
                     else:
                         print("\n❌ Homografi-beregning fejlede — prøv igen med SPACE.")
-                else:
-                    print("\n❌ Ingen kalibreringspunkter fundet — sørg for at skiven er synlig.")
 
             # --- Snapshot scoring ---
             if self._snapshot_requested and self._homography is not None:
@@ -248,14 +219,12 @@ class DartPipeline:
             print("\n⚠️  Ingen pile fundet i billedet — prøv igen.")
             return
 
-        # Score all currently visible darts
         all_results = self._scorer.score_detections_with_homography(
             detection.dart_tips,
             self._homography,
             [1.0] * len(detection.dart_tips),
         )
 
-        # Find which tips are NEW (not already in _scored_tips)
         new_results: list[ScoreResult] = []
         for result in all_results:
             tip = (result.pixel_x, result.pixel_y)
@@ -289,21 +258,23 @@ class DartPipeline:
 
         h, w = preview.shape[:2]
 
-        # --- Top left: calibration + instruction ---
         cal_count = len(detection.cal_points)
         if self._homography is not None:
             cal_text = f"Cal: OK [{self._homography_source}]"
             cal_color = (0, 255, 0)
-            instruction = "SPACE = score pil  |  C = kalibrér  |  Q = afslut"
+            instruction = "SPACE = score pil  |  C = rekalibrér  |  Q = afslut"
         else:
-            cal_text = f"Cal: {cal_count}/4 — SPACE for at kalibrere"
-            cal_color = (0, 165, 255) if cal_count > 0 else (0, 0, 255)
-            instruction = "SPACE = kalibrér  |  Q = afslut"
+            if cal_count >= MIN_HOMOGRAPHY_POINTS:
+                cal_text = f"Cal: {cal_count}/4 klar — SPACE for at kalibrere"
+                cal_color = (0, 255, 165)
+            else:
+                cal_text = f"Cal: {cal_count}/4 — venter på {MIN_HOMOGRAPHY_POINTS - cal_count} punkt(er) mere"
+                cal_color = (0, 165, 255) if cal_count > 0 else (0, 0, 255)
+            instruction = "SPACE = kalibrér (kræver 4/4)  |  Q = afslut"
 
         cv2.putText(preview, cal_text, (10, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, cal_color, 2)
 
-        # --- Top right: score overlay ---
         with self._overlay_lock:
             overlay = self._score_overlay
 
@@ -325,7 +296,6 @@ class DartPipeline:
                 cv2.putText(preview, hand_text, (w - tw - 10, 108),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 100), 2)
 
-        # --- Bottom: instruction ---
         cv2.putText(preview, instruction,
                     (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
