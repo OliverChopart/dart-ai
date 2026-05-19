@@ -24,6 +24,7 @@ class GameSession:
         self._on_throw = on_throw
         self._pipeline = DartPipeline(
             on_score_callback=self._on_score_event,
+            on_new_turn_callback=self.new_turn,
             model_path=model_path,
             show_preview=show_preview,
         )
@@ -45,23 +46,20 @@ class GameSession:
     def undo(self) -> str:
         msg = self._game.undo_last_throw()
         if self._hand_scores:
-            last_score = self._hand_scores.pop()
-            # Recalculate hand total from remaining hand scores
-            self._hand_total = sum(
-                self._parse_score(s) for s in self._hand_scores
-            )
+            self._hand_scores.pop()
+            self._hand_total = sum(self._parse_score(s) for s in self._hand_scores)
         self._push_overlay()
         return msg
 
     def new_turn(self) -> None:
-        """Call when darts are removed from the board (new turn)."""
+        """Nulstil hånd-scores og pile-tæller. Kaldes fra ENTER eller terminal."""
         self._hand_scores = []
         self._hand_total = 0
         self._pipeline.reset_dart_count()
         self._push_overlay()
+        logger.info("new turn", player=self._game.state.current_player.display_name)
 
     def tick_preview(self) -> bool:
-        """Display the latest camera frame. Must be called from main thread."""
         return self._pipeline.tick_preview()
 
     @property
@@ -77,7 +75,6 @@ class GameSession:
     # ------------------------------------------------------------------
 
     def _parse_score(self, segment: str) -> int:
-        """Parse a segment label to its point value."""
         if segment == "Bullseye":
             return 50
         if segment == "Bull":
@@ -90,7 +87,6 @@ class GameSession:
             return 0
 
     def _push_overlay(self) -> None:
-        """Send current score info to the pipeline for display in preview."""
         player = self._game.state.current_player
         self._pipeline.update_score_overlay(ScoreOverlay(
             player_name=player.display_name,
@@ -100,11 +96,7 @@ class GameSession:
         ))
 
     def _on_score_event(self, event: ScoreEvent) -> None:
-        """Called by pipeline for each SPACE press with new darts.
-
-        event.results contains only the NEW darts detected since last snapshot.
-        We register each of them as a throw and update the overlay.
-        """
+        """Registrer alle nye pile fra dette snapshot."""
         if self._game.state.status != GameStatus.ACTIVE:
             return
 
@@ -131,9 +123,8 @@ class GameSession:
                 remaining=self._game.state.current_player.score_remaining,
             )
 
-            # Stop processing if the turn ended (bust, win, or 3rd dart)
+            # Stop hvis turen er slut (bust, win eller 3. pil)
             if throw_result.turn_complete:
-                # Auto-reset hand display after turn complete
                 self._hand_scores = []
                 self._hand_total = 0
                 self._pipeline.reset_dart_count()
