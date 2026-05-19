@@ -71,17 +71,12 @@ _CAL_SEGMENT_ANGLES: dict[int, float] = {
 # Radius of the double ring in the canonical 800x800 output image (pixels)
 _DOUBLE_RING_RADIUS = 380.0
 
+# cv2.findHomography requires AT LEAST 4 point pairs regardless of method
+MIN_HOMOGRAPHY_POINTS = 4
+
 
 def _cal_destination(segment: int, output_size: int = DEFAULT_OUTPUT_SIZE) -> tuple[float, float]:
-    """Return the canonical pixel coordinate for a calibration segment corner.
-
-    Args:
-        segment: Dartboard segment number — one of 20, 6, 3, 11.
-        output_size: Side length of the canonical square output image.
-
-    Returns:
-        (x, y) pixel coordinate in the canonical top-down view.
-    """
+    """Return the canonical pixel coordinate for a calibration segment corner."""
     if segment not in _CAL_SEGMENT_ANGLES:
         raise ValueError(f"Unknown calibration segment: {segment}. Must be one of 20, 6, 3, 11.")
     angle_deg = _CAL_SEGMENT_ANGLES[segment]
@@ -98,23 +93,25 @@ def compute_homography_from_detections(
     cal_points: dict[int, tuple[float, float]],
     output_size: int = DEFAULT_OUTPUT_SIZE,
     method: int = cv2.RANSAC,
-    min_points: int = 1,
 ) -> Optional[np.ndarray]:
     """Compute a homography matrix from YOLO-detected calibration points.
+
+    Requires exactly 4 detected calibration points — cv2.findHomography
+    cannot compute a homography from fewer than 4 point pairs.
 
     Args:
         cal_points: Dict mapping segment number (20, 6, 3, 11) to the
                     (x, y) pixel coordinate detected by YOLO.
         output_size: Side length of the canonical output image in pixels.
-        method: cv2.findHomography method. Use 0 for < 4 points (no RANSAC).
-        min_points: Minimum number of points required (default 1).
+        method: cv2.findHomography estimation method.
 
     Returns:
-        3x3 float32 homography matrix, or None if computation fails.
+        3x3 float32 homography matrix, or None if fewer than 4 points
+        are available or cv2.findHomography fails.
     """
     valid_segments = [s for s in (20, 6, 3, 11) if s in cal_points]
 
-    if len(valid_segments) < min_points:
+    if len(valid_segments) < MIN_HOMOGRAPHY_POINTS:
         return None
 
     src_pts: list[list[float]] = []
@@ -128,10 +125,7 @@ def compute_homography_from_detections(
     src = np.array(src_pts, dtype=np.float32)
     dst = np.array(dst_pts, dtype=np.float32)
 
-    # findHomography requires >= 4 points for RANSAC — use direct method for fewer
-    actual_method = method if len(valid_segments) >= 4 else 0
-
-    H, mask = cv2.findHomography(src, dst, actual_method)
+    H, mask = cv2.findHomography(src, dst, method)
     if H is None:
         logger.error("cv2.findHomography failed — points may be collinear")
         return None
@@ -144,7 +138,7 @@ def compute_homography_from_detections(
 # ---------------------------------------------------------------------------
 
 def _destination_points_manual(output_size: int) -> np.ndarray:
-    """Return the 4 destination corners for the manual (top/right/bottom/left) calibration."""
+    """Return the 4 destination corners for manual calibration."""
     half = output_size / 2
     margin = output_size * 0.02
     r = half - margin
