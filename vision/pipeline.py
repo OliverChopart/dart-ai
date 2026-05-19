@@ -6,20 +6,19 @@ Scoring flow
 ------------
 Scoring is MANUAL and per-dart:
 
-1. User throws a dart
-2. User presses SPACE → pipeline snapshots the current frame
-3. Pipeline scores ALL darts visible and compares to last snapshot
-4. Only NEW darts (not seen in the previous snapshot) are emitted as scores
-5. User throws next dart, presses SPACE again — only the new dart is scored
+1. Kast en pil
+2. Tryk SPACE → snapshot: scorer kun den NYE pil (ikke dem der allerede var der)
+3. Kast næste pil, tryk SPACE igen → scorer kun den seneste pil
+4. Tryk ENTER i terminalen → fjern pile, ny tur, hukommelse nulstilles
 
-Pressing SPACE before calibration triggers calibration instead.
-Pressing C at any time re-calibrates.
+Teknisk: pipelinen husker pixel-positionerne på alle pile der er scoret denne tur.
+Ved hvert SPACE-tryk scores kun pile der IKKE matcher en tidligere scoret position.
 
-macOS / OpenCV note
--------------------
-cv2.imshow() must be called from the main thread on macOS. The background
-thread writes annotated frames to _latest_preview; tick_preview() in the
-main loop handles display and keyboard events.
+Kalibrering:
+  SPACE (før kalibrering) → kalibrer
+  C (når som helst)       → rekalibrér
+
+macOS note: cv2.imshow() skal kaldes fra main thread — tick_preview() håndterer dette.
 """
 
 from __future__ import annotations
@@ -48,17 +47,17 @@ logger = get_logger(__name__)
 
 @dataclass
 class ScoreEvent:
-    """Emitted when the user presses SPACE after throwing a dart."""
+    """Emitted when user presses SPACE and a new dart is detected."""
 
-    results: list[ScoreResult]
-    dart_count: int
+    results: list[ScoreResult]       # kun de NYE pile siden forrige snapshot
+    dart_count: int                  # antal pile på skiven i alt
     homography_source: str = "unknown"
     frame: np.ndarray | None = None
 
 
 @dataclass
 class ScoreOverlay:
-    """Score info passed from GameSession to pipeline for display in preview."""
+    """Score info til display i preview-vinduet."""
 
     player_name: str = ""
     score_remaining: int = 0
@@ -71,9 +70,10 @@ class ScoreOverlay:
 
 
 class DartPipeline:
-    """Ties together VideoStream -> YOLO -> per-dart snapshot scoring."""
+    """VideoStream -> YOLO -> manuel snapshot-scoring per pil."""
 
-    MATCH_TOLERANCE: float = 40.0
+    # Hvor langt en pil må have flyttet sig og stadig regnes som "samme pil" (pixels)
+    MATCH_TOLERANCE: float = 60.0
 
     def __init__(
         self,
@@ -96,6 +96,7 @@ class DartPipeline:
         self._calibration_requested: bool = False
         self._snapshot_requested: bool = False
 
+        # Hukommelse: pixel-positioner på pile der allerede er scoret denne tur
         self._scored_tips: list[tuple[float, float]] = []
 
         self._latest_preview: np.ndarray | None = None
@@ -128,8 +129,8 @@ class DartPipeline:
         logger.info("pipeline stopped")
 
     def tick_preview(self) -> bool:
-        """Display the latest frame and handle keyboard input.
-        Must be called from the MAIN THREAD. Returns False if user pressed Q.
+        """Vis seneste frame og håndtér tastatur. SKAL kaldes fra main thread.
+        Returnerer False hvis brugeren trykker Q.
         """
         if not self._show_preview:
             return True
@@ -154,7 +155,7 @@ class DartPipeline:
         return True
 
     def reset_dart_count(self) -> None:
-        """Call when darts are removed from the board (new turn)."""
+        """Kald når pile fjernes fra skiven (ny tur). Nulstiller hukommelsen."""
         self._scored_tips = []
 
     def update_score_overlay(self, overlay: ScoreOverlay) -> None:
@@ -181,15 +182,15 @@ class DartPipeline:
 
             detection = self._detector.detect(frame, annotate=self._show_preview)
 
-            # --- Calibration ---
+            # --- Kalibrering ---
             if self._calibration_requested:
                 self._calibration_requested = False
                 cal_count = len(detection.cal_points)
 
                 if cal_count < MIN_HOMOGRAPHY_POINTS:
                     print(
-                        f"\n❌ Kalibrering fejlede — kun {cal_count}/4 punkter fundet."
-                        f"\n   Homografi kræver præcist 4 punkter. Prøv igen med SPACE."
+                        f"\n❌ Kalibrering fejlede — {cal_count}/4 punkter fundet."
+                        f"\n   Kræver 4 punkter. Sørg for at hele skiven er synlig og prøv igen."
                     )
                 else:
                     H_new = compute_homography_from_detections(
@@ -200,44 +201,54 @@ class DartPipeline:
                         self._homography = H_new
                         self._homography_source = "yolo"
                         self._scored_tips = []
-                        print(f"\n✅ Kalibrering lykkedes! (4/4 punkter fundet)")
+                        print("\n✅ Kalibrering lykkedes! Kast en pil og tryk SPACE.")
                     else:
-                        print("\n❌ Homografi-beregning fejlede — prøv igen med SPACE.")
+                        print("\n❌ Homografi-beregning fejlede — prøv igen.")
 
             # --- Snapshot scoring ---
             if self._snapshot_requested and self._homography is not None:
                 self._snapshot_requested = False
                 self._score_snapshot(frame, detection)
 
-            # --- Build preview ---
+            # --- Preview ---
             if self._show_preview:
                 self._build_preview(frame, detection)
 
     def _score_snapshot(self, frame: np.ndarray, detection) -> None:
-        """Score only the darts that weren't scored in the previous snapshot."""
+        """Score kun pile der ikke allerede er scoret denne tur."""
         if not detection.dart_tips:
-            print("\n⚠️  Ingen pile fundet i billedet — prøv igen.")
+            print("\n⚠️  Ingen pile fundet — er pilen landet på skiven?")
             return
 
+        # Score alle synlige pile
         all_results = self._scorer.score_detections_with_homography(
             detection.dart_tips,
             self._homography,
             [1.0] * len(detection.dart_tips),
         )
 
+        print(f"\n🔍 Snapshot: {len(detection.dart_tips)} pile fundet i alt, {len(self._scored_tips)} allerede scoret")
+
+        # Filtrer: behold kun pile der IKKE matcher en allerede scoret position
         new_results: list[ScoreResult] = []
         for result in all_results:
             tip = (result.pixel_x, result.pixel_y)
-            already_scored = any(
-                math.hypot(tip[0] - prev[0], tip[1] - prev[1]) < self.MATCH_TOLERANCE
+            distances = [
+                math.hypot(tip[0] - prev[0], tip[1] - prev[1])
                 for prev in self._scored_tips
-            )
-            if not already_scored:
+            ]
+            min_dist = min(distances) if distances else float("inf")
+            already_scored = min_dist < self.MATCH_TOLERANCE
+
+            if already_scored:
+                print(f"   ↩ Springer over {result.segment} — matcher tidligere pil (dist={min_dist:.0f}px)")
+            else:
                 new_results.append(result)
                 self._scored_tips.append(tip)
+                print(f"   ✅ Ny pil: {result.segment} ({result.score}p) på pixel ({tip[0]:.0f}, {tip[1]:.0f})")
 
         if not new_results:
-            print("\n⚠️  Ingen nye pile siden sidste snapshot — er pilen landet?")
+            print("⚠️  Ingen nye pile siden forrige snapshot.")
             return
 
         event = ScoreEvent(
@@ -249,7 +260,7 @@ class DartPipeline:
         self._callback(event)
 
     def _build_preview(self, frame: np.ndarray, detection) -> None:
-        """Build the annotated preview frame for display."""
+        """Byg annoteret preview-frame til display."""
         preview = (
             detection.annotated_frame.copy()
             if detection.annotated_frame is not None
@@ -268,7 +279,7 @@ class DartPipeline:
                 cal_text = f"Cal: {cal_count}/4 klar — SPACE for at kalibrere"
                 cal_color = (0, 255, 165)
             else:
-                cal_text = f"Cal: {cal_count}/4 — venter på {MIN_HOMOGRAPHY_POINTS - cal_count} punkt(er) mere"
+                cal_text = f"Cal: {cal_count}/4 — mangler {MIN_HOMOGRAPHY_POINTS - cal_count} punkt(er)"
                 cal_color = (0, 165, 255) if cal_count > 0 else (0, 0, 255)
             instruction = "SPACE = kalibrér (kræver 4/4)  |  Q = afslut"
 
