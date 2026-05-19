@@ -11,8 +11,9 @@ Scoring is MANUAL and per-dart:
 3. Kast næste pil, tryk SPACE igen → scorer kun den seneste pil
 4. Tryk ENTER i terminalen → fjern pile, ny tur, hukommelse nulstilles
 
-Teknisk: pipelinen husker pixel-positionerne på alle pile der er scoret denne tur.
-Ved hvert SPACE-tryk scores kun pile der IKKE matcher en tidligere scoret position.
+Teknisk: pipelinen husker antallet af pile der er scoret denne tur (_darts_scored).
+Ved hvert SPACE-tryk sorteres pile efter afstand fra centrum, og pile nummer
+_darts_scored+1 og frem regnes som nye. Dette er robust uanset pixel-koordinater.
 
 Kalibrering:
   SPACE (før kalibrering) → kalibrer
@@ -49,8 +50,8 @@ logger = get_logger(__name__)
 class ScoreEvent:
     """Emitted when user presses SPACE and a new dart is detected."""
 
-    results: list[ScoreResult]       # kun de NYE pile siden forrige snapshot
-    dart_count: int                  # antal pile på skiven i alt
+    results: list[ScoreResult]
+    dart_count: int
     homography_source: str = "unknown"
     frame: np.ndarray | None = None
 
@@ -71,9 +72,6 @@ class ScoreOverlay:
 
 class DartPipeline:
     """VideoStream -> YOLO -> manuel snapshot-scoring per pil."""
-
-    # Hvor langt en pil må have flyttet sig og stadig regnes som "samme pil" (pixels)
-    MATCH_TOLERANCE: float = 60.0
 
     def __init__(
         self,
@@ -96,8 +94,8 @@ class DartPipeline:
         self._calibration_requested: bool = False
         self._snapshot_requested: bool = False
 
-        # Hukommelse: pixel-positioner på pile der allerede er scoret denne tur
-        self._scored_tips: list[tuple[float, float]] = []
+        # Antal pile scoret denne tur — bruges til at finde nye pile
+        self._darts_scored: int = 0
 
         self._latest_preview: np.ndarray | None = None
         self._preview_lock = threading.Lock()
@@ -129,9 +127,7 @@ class DartPipeline:
         logger.info("pipeline stopped")
 
     def tick_preview(self) -> bool:
-        """Vis seneste frame og håndtér tastatur. SKAL kaldes fra main thread.
-        Returnerer False hvis brugeren trykker Q.
-        """
+        """Vis seneste frame og håndtér tastatur. SKAL kaldes fra main thread."""
         if not self._show_preview:
             return True
 
@@ -155,8 +151,8 @@ class DartPipeline:
         return True
 
     def reset_dart_count(self) -> None:
-        """Kald når pile fjernes fra skiven (ny tur). Nulstiller hukommelsen."""
-        self._scored_tips = []
+        """Kald når pile fjernes fra skiven (ny tur)."""
+        self._darts_scored = 0
 
     def update_score_overlay(self, overlay: ScoreOverlay) -> None:
         with self._overlay_lock:
@@ -200,7 +196,7 @@ class DartPipeline:
                     if H_new is not None:
                         self._homography = H_new
                         self._homography_source = "yolo"
-                        self._scored_tips = []
+                        self._darts_scored = 0
                         print("\n✅ Kalibrering lykkedes! Kast en pil og tryk SPACE.")
                     else:
                         print("\n❌ Homografi-beregning fejlede — prøv igen.")
@@ -215,45 +211,49 @@ class DartPipeline:
                 self._build_preview(frame, detection)
 
     def _score_snapshot(self, frame: np.ndarray, detection) -> None:
-        """Score kun pile der ikke allerede er scoret denne tur."""
-        if not detection.dart_tips:
-            print("\n⚠️  Ingen pile fundet — er pilen landet på skiven?")
+        """Score nye pile baseret på antal — ikke pixel-position.
+
+        Logik: sorter alle detekterede pile efter afstand fra billedets centrum
+        (stabil sortering). Pile 0..(_darts_scored-1) er allerede scoret.
+        Pile _darts_scored.. er nye og scores nu.
+        """
+        total = len(detection.dart_tips)
+        print(f"\n🔍 Snapshot: {total} pile fundet, {self._darts_scored} allerede scoret")
+
+        if total == 0:
+            print("⚠️  Ingen pile fundet — er pilen landet på skiven?")
             return
 
-        # Score alle synlige pile
-        all_results = self._scorer.score_detections_with_homography(
+        if total <= self._darts_scored:
+            print(f"⚠️  Ikke flere pile end sidst ({total} <= {self._darts_scored}) — er der kastet en ny pil?")
+            return
+
+        # Sorter pile efter afstand fra billedcentrum (konsistent sortering på tværs af frames)
+        frame_cx = frame.shape[1] / 2
+        frame_cy = frame.shape[0] / 2
+        sorted_tips = sorted(
             detection.dart_tips,
-            self._homography,
-            [1.0] * len(detection.dart_tips),
+            key=lambda t: math.hypot(t[0] - frame_cx, t[1] - frame_cy),
         )
 
-        print(f"\n🔍 Snapshot: {len(detection.dart_tips)} pile fundet i alt, {len(self._scored_tips)} allerede scoret")
+        # Nye pile er dem der er kommet til siden sidst
+        new_tips = sorted_tips[self._darts_scored:]
 
-        # Filtrer: behold kun pile der IKKE matcher en allerede scoret position
-        new_results: list[ScoreResult] = []
-        for result in all_results:
-            tip = (result.pixel_x, result.pixel_y)
-            distances = [
-                math.hypot(tip[0] - prev[0], tip[1] - prev[1])
-                for prev in self._scored_tips
-            ]
-            min_dist = min(distances) if distances else float("inf")
-            already_scored = min_dist < self.MATCH_TOLERANCE
+        # Score kun de nye pile
+        new_results = self._scorer.score_detections_with_homography(
+            new_tips,
+            self._homography,
+            [1.0] * len(new_tips),
+        )
 
-            if already_scored:
-                print(f"   ↩ Springer over {result.segment} — matcher tidligere pil (dist={min_dist:.0f}px)")
-            else:
-                new_results.append(result)
-                self._scored_tips.append(tip)
-                print(f"   ✅ Ny pil: {result.segment} ({result.score}p) på pixel ({tip[0]:.0f}, {tip[1]:.0f})")
+        for result in new_results:
+            print(f"   ✅ Ny pil: {result.segment} ({result.score}p)")
 
-        if not new_results:
-            print("⚠️  Ingen nye pile siden forrige snapshot.")
-            return
+        self._darts_scored = total
 
         event = ScoreEvent(
             results=new_results,
-            dart_count=len(detection.dart_tips),
+            dart_count=total,
             homography_source=self._homography_source,
             frame=frame.copy() if self._show_preview else None,
         )
