@@ -49,15 +49,21 @@ DEFAULT_OUTPUT_SIZE = 800
 # ---------------------------------------------------------------------------
 # Calibration point geometry
 # ---------------------------------------------------------------------------
-# Angles (degrees, clockwise from 12 o'clock) for the upper-left corner of
-# each double-ring segment used as a calibration landmark.
-# These match dart-sense's convention and assume the standard dartboard layout.
-# Validate against your annotated dataset and adjust if needed.
+# Angles (degrees, clockwise from 12 o'clock) for the centre of each
+# calibration segment on the double ring.
+# Standard dartboard layout (clockwise from top):
+#   20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5
+#
+# Segment positions (each segment = 18°, segment 20 centred at 0°):
+#   20 =   0°  (top,    12 o'clock)
+#    6 =  99°  (right,   ~3:20)
+#    3 = 180°  (bottom,   6 o'clock)
+#   11 = 261°  (left,    ~8:40)
 _CAL_SEGMENT_ANGLES: dict[int, float] = {
-    20: 351.0,   # just left of 12 o'clock (upper-left of D20 bbox)
-    6:   62.0,   # upper-right quadrant
-    3:  102.0,   # right side
-    11: 138.0,   # lower-right quadrant
+    20:   0.0,   # top
+    6:   99.0,   # right
+    3:  180.0,   # bottom
+    11: 261.0,   # left
 }
 
 # Radius of the double ring in the canonical 800x800 output image (pixels)
@@ -90,34 +96,23 @@ def compute_homography_from_detections(
     cal_points: dict[int, tuple[float, float]],
     output_size: int = DEFAULT_OUTPUT_SIZE,
     method: int = cv2.RANSAC,
+    min_points: int = 1,
 ) -> Optional[np.ndarray]:
     """Compute a homography matrix from YOLO-detected calibration points.
 
-    This is the primary calibration path when using the 5-class model.
-    It is called on every frame so the homography adapts automatically to
-    camera movement, zoom changes, and any perspective shift.
-
     Args:
         cal_points: Dict mapping segment number (20, 6, 3, 11) to the
-                    (x, y) pixel coordinate detected by YOLO in the current
-                    frame.  Partial detection (fewer than 4 points) returns
-                    None — the caller should fall back to the last known H.
+                    (x, y) pixel coordinate detected by YOLO.
         output_size: Side length of the canonical output image in pixels.
-        method: Homography estimation method passed to cv2.findHomography.
-                RANSAC is recommended for robustness against detection noise.
+        method: cv2.findHomography method. Use 0 for < 4 points (no RANSAC).
+        min_points: Minimum number of points required (default 1).
 
     Returns:
-        3x3 float32 homography matrix, or None if fewer than 4 points are
-        available or cv2.findHomography fails.
+        3x3 float32 homography matrix, or None if computation fails.
     """
     valid_segments = [s for s in (20, 6, 3, 11) if s in cal_points]
 
-    if len(valid_segments) < 4:
-        logger.debug(
-            "insufficient calibration points for homography",
-            found=len(valid_segments),
-            segments=valid_segments,
-        )
+    if len(valid_segments) < min_points:
         return None
 
     src_pts: list[list[float]] = []
@@ -131,13 +126,14 @@ def compute_homography_from_detections(
     src = np.array(src_pts, dtype=np.float32)
     dst = np.array(dst_pts, dtype=np.float32)
 
-    H, mask = cv2.findHomography(src, dst, method)
+    # findHomography requires >= 4 points for RANSAC — use direct method for fewer
+    actual_method = method if len(valid_segments) >= 4 else 0
+
+    H, mask = cv2.findHomography(src, dst, actual_method)
     if H is None:
-        logger.error("cv2.findHomography failed — check that calibration points are not collinear")
+        logger.error("cv2.findHomography failed — points may be collinear")
         return None
 
-    inliers = int(mask.sum()) if mask is not None else len(src_pts)
-    logger.debug("homography computed from detections", inliers=inliers, total=len(src_pts))
     return H
 
 
@@ -166,12 +162,7 @@ def compute_homography(
     src_points: List[Tuple[float, float]],
     output_size: int = DEFAULT_OUTPUT_SIZE,
 ) -> np.ndarray:
-    """Compute a 3x3 homography matrix from 4 manually selected source points.
-
-    Use this for the manual calibration fallback (run_calibration).
-    For automatic calibration from YOLO detections use
-    compute_homography_from_detections() instead.
-    """
+    """Compute a 3x3 homography matrix from 4 manually selected source points."""
     if len(src_points) != 4:
         raise ValueError(f"Expected exactly 4 source points, got {len(src_points)}")
     src = np.array(src_points, dtype=np.float32)
@@ -194,7 +185,6 @@ def save_homography(
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(str(path), H)
-    logger.info("homography saved", path=str(path))
 
     sidecar = path.with_suffix(".json")
     meta = {
@@ -204,7 +194,6 @@ def save_homography(
         "homography": H.tolist(),
     }
     sidecar.write_text(json.dumps(meta, indent=2))
-    logger.info("homography metadata saved", path=str(sidecar))
 
 
 def load_homography(path: Path | str = DEFAULT_HOMOGRAPHY_PATH) -> np.ndarray:
@@ -216,9 +205,7 @@ def load_homography(path: Path | str = DEFAULT_HOMOGRAPHY_PATH) -> np.ndarray:
             "Run 'scripts/run_calibration.py' or wait for automatic calibration "
             "from the 5-class YOLO model."
         )
-    H = np.load(str(path))
-    logger.info("homography loaded", path=str(path))
-    return H
+    return np.load(str(path))
 
 
 def apply_homography(
@@ -273,7 +260,6 @@ class _ClickCollector:
             self.display, label, (x + 8, y - 8),
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
         )
-        logger.info("calibration point collected", index=idx + 1, label=self.LABELS[idx], x=x, y=y)
 
     def overlay_instructions(self) -> None:
         if len(self.points) < self.n:
@@ -299,24 +285,11 @@ def run_calibration(
     output_size: int = DEFAULT_OUTPUT_SIZE,
     window_name: str = "Dart Board Calibration",
 ) -> np.ndarray:
-    """Open an interactive window and let the user click 4 calibration points.
-
-    This is the manual fallback for use before a 5-class YOLO model is
-    available.  Click the outermost point of the double ring at:
-        1. TOP    (double-20, 12 o'clock)
-        2. RIGHT  (double-6)
-        3. BOTTOM (double-3)
-        4. LEFT   (double-11)
-
-    The computed homography is saved to output_path and will be loaded
-    automatically by DartPipeline as a fallback when automatic calibration
-    from YOLO is unavailable.
-    """
+    """Open an interactive window and let the user click 4 calibration points."""
     if image_path is not None:
         frame = cv2.imread(str(image_path))
         if frame is None:
             raise FileNotFoundError(f"Cannot read image: '{image_path}'")
-        logger.info("using still image for calibration", path=str(image_path))
     else:
         cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
@@ -325,30 +298,25 @@ def run_calibration(
         cap.release()
         if not ret or frame is None:
             raise RuntimeError("Failed to grab a frame from the camera.")
-        logger.info("captured still from live camera for calibration")
 
     collector = _ClickCollector(frame)
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, min(frame.shape[1], 1280), min(frame.shape[0], 900))
     cv2.setMouseCallback(window_name, collector)
 
-    print("[calibration] -----------------------------------------------")
-    print("[calibration] Click the outermost point of the double ring")
-    print("[calibration] Order:  TOP (D20) -> RIGHT (D6) -> BOTTOM (D3) -> LEFT (D11)")
+    print("[calibration] Click: TOP (D20) -> RIGHT (D6) -> BOTTOM (D3) -> LEFT (D11)")
     print("[calibration] ENTER to confirm, R to reset, Q to quit.")
-    print("[calibration] -----------------------------------------------")
 
     while True:
         collector.overlay_instructions()
         cv2.imshow(window_name, collector.display)
         key = cv2.waitKey(20) & 0xFF
-        if key in (13, 10):  # ENTER
+        if key in (13, 10):
             if len(collector.points) < 4:
                 print("[calibration] Need 4 points before confirming.")
             else:
                 break
         elif key in (ord('r'), ord('R')):
-            print("[calibration] Resetting — click 4 new points.")
             collector.reset()
         elif key in (ord('q'), ord('Q')):
             cv2.destroyAllWindows()
