@@ -1,30 +1,36 @@
 """Live dart detection pipeline.
 
-Reads frames from VideoStream, runs YOLO detection, scores each dart tip
-via homography, and emits ScoreEvents to a callback.
+Reads frames from VideoStream, runs YOLO detection, and emits ScoreEvents.
 
-Calibration strategy
---------------------
-On startup the pipeline shows a live camera feed but does NOT attempt
-calibration automatically.  The user must press SPACE in the preview window
-to trigger a calibration attempt.
+Scoring flow
+------------
+Scoring is MANUAL and per-dart:
 
-Calibration requires minimum 1 cal point — the user can force calibration
-at any time by pressing SPACE, even with partial detection.  More points
-= more accurate homography.  4/4 is ideal, 3/4 is good, 1-2/4 is rough.
+1. User throws a dart
+2. User presses SPACE → pipeline snapshots the current frame
+3. Pipeline scores ALL darts visible and compares to last snapshot
+4. Only NEW darts (not seen in the previous snapshot) are emitted as scores
+5. User throws next dart, presses SPACE again — only the new dart is scored
+
+Pressing SPACE before calibration triggers calibration instead.
+Pressing C at any time re-calibrates.
+
+This design means:
+- The board can have 1, 2, or 3 darts in it at any time
+- Each SPACE press scores only the dart that was just thrown
+- No automatic detection — zero false positives
 
 macOS / OpenCV note
 -------------------
-cv2.imshow() must be called from the main thread on macOS.  The background
-inference thread stores the latest annotated frame in self._latest_preview,
-and the caller must call pipeline.tick_preview() in its main loop.
+cv2.imshow() must be called from the main thread on macOS. The background
+thread writes annotated frames to _latest_preview; tick_preview() in the
+main loop handles display and keyboard events.
 """
 
 from __future__ import annotations
 
 import math
 import threading
-from collections import deque
 from dataclasses import dataclass
 from typing import Callable
 
@@ -48,10 +54,10 @@ MIN_CAL_POINTS = 1
 
 @dataclass
 class ScoreEvent:
-    """Emitted when a new dart is detected and scored."""
+    """Emitted when the user presses SPACE after throwing a dart."""
 
-    results: list[ScoreResult]
-    dart_count: int
+    results: list[ScoreResult]       # only the NEW dart(s) since last snapshot
+    dart_count: int                  # total darts on board right now
     homography_source: str = "unknown"
     frame: np.ndarray | None = None
 
@@ -61,9 +67,9 @@ class ScoreOverlay:
     """Score info passed from GameSession to pipeline for display in preview."""
 
     player_name: str = ""
-    score_remaining: int = 0      # total score remaining e.g. 245
-    hand_scores: list[str] = None  # scores this hand e.g. ["T20", "5", "1"]
-    hand_total: int = 0            # sum this hand e.g. 66
+    score_remaining: int = 0
+    hand_scores: list[str] = None
+    hand_total: int = 0
 
     def __post_init__(self):
         if self.hand_scores is None:
@@ -71,12 +77,15 @@ class ScoreOverlay:
 
 
 class DartPipeline:
-    """Ties together VideoStream -> YOLO -> Homography -> Score."""
+    """Ties together VideoStream -> YOLO -> per-dart snapshot scoring.
 
-    DEBOUNCE_FRAMES: int = 8
-    FIFO_SIZE: int = 5
-    FIFO_MIN_HITS: int = 3
-    FIFO_TOLERANCE: float = 15.0
+    The user presses SPACE to score the dart they just threw. The pipeline
+    remembers which darts were already scored and only emits new ones.
+    Pressing ENTER (new_turn) resets the memory so the next turn starts fresh.
+    """
+
+    # Position tolerance for matching darts across snapshots (pixels)
+    MATCH_TOLERANCE: float = 40.0
 
     def __init__(
         self,
@@ -97,25 +106,20 @@ class DartPipeline:
         self._homography: np.ndarray | None = None
         self._homography_source: str = "none"
 
-        # Calibration trigger
+        # Triggers set from main thread, consumed in bg thread
         self._calibration_requested: bool = False
+        self._snapshot_requested: bool = False
 
-        # Score overlay — updated by GameSession after each throw
-        self._score_overlay: ScoreOverlay = ScoreOverlay()
-        self._overlay_lock = threading.Lock()
+        # Memory: positions of darts already scored this turn
+        self._scored_tips: list[tuple[float, float]] = []
 
-        # Latest frame for display — written by bg thread, read by main thread
+        # Latest frame for display
         self._latest_preview: np.ndarray | None = None
         self._preview_lock = threading.Lock()
 
-        # FIFO queue
-        self._dart_fifo: deque[list[tuple[float, float]]] = deque(maxlen=self.FIFO_SIZE)
-
-        # Debounce state
-        self._last_dart_count: int = 0
-        self._debounce_counter: int = 0
-        self._pending_count: int = 0
-        self._pending_results: list[ScoreResult] = []
+        # Score overlay
+        self._score_overlay: ScoreOverlay = ScoreOverlay()
+        self._overlay_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public interface
@@ -130,7 +134,7 @@ class DartPipeline:
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
-        logger.info("pipeline started — press SPACE in preview window to calibrate")
+        logger.info("pipeline started")
 
     def stop(self) -> None:
         """Stop the pipeline and release resources."""
@@ -146,6 +150,11 @@ class DartPipeline:
         """Display the latest frame and handle keyboard input.
 
         Must be called from the MAIN THREAD. Returns False if user pressed Q.
+
+        Keys:
+            SPACE — calibrate (before calibration) or score snapshot (after)
+            C     — re-calibrate at any time
+            Q     — quit
         """
         if not self._show_preview:
             return True
@@ -158,23 +167,28 @@ class DartPipeline:
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord(" "):
+            if self._homography is None:
+                self._calibration_requested = True
+            else:
+                self._snapshot_requested = True
+        elif key == ord("c"):
             self._calibration_requested = True
         elif key == ord("q"):
             return False
 
         return True
 
+    def reset_dart_count(self) -> None:
+        """Call when darts are removed from the board (new turn).
+        Clears the scored-dart memory so the next turn starts fresh.
+        """
+        self._scored_tips = []
+        logger.info("dart memory reset for new turn")
+
     def update_score_overlay(self, overlay: ScoreOverlay) -> None:
         """Update the score info shown in the preview. Thread-safe."""
         with self._overlay_lock:
             self._score_overlay = overlay
-
-    def reset_dart_count(self) -> None:
-        """Call this when darts are removed from the board (new turn)."""
-        self._last_dart_count = 0
-        self._debounce_counter = 0
-        self._pending_count = 0
-        self._dart_fifo.clear()
 
     @property
     def has_homography(self) -> bool:
@@ -197,11 +211,10 @@ class DartPipeline:
 
             detection = self._detector.detect(frame, annotate=self._show_preview)
 
-            # Handle calibration request
+            # --- Calibration ---
             if self._calibration_requested:
                 self._calibration_requested = False
                 cal_count = len(detection.cal_points)
-
                 if cal_count >= MIN_CAL_POINTS:
                     H_new = compute_homography_from_detections(
                         detection.cal_points,
@@ -210,128 +223,111 @@ class DartPipeline:
                     if H_new is not None:
                         self._homography = H_new
                         self._homography_source = "yolo"
+                        self._scored_tips = []  # reset memory on recalibration
                         print(
-                            f"\n✅ Kalibrering lykkedes! ({cal_count}/4 punkter fundet)"
-                            + ("" if cal_count == 4 else "\n   ⚠️  Delvis kalibrering — scorer kan være unøjagtige")
+                            f"\n✅ Kalibrering lykkedes! ({cal_count}/4 punkter)"
+                            + ("" if cal_count == 4 else "\n   ⚠️  Delvis kalibrering")
                         )
                     else:
                         print("\n❌ Homografi-beregning fejlede — prøv igen med SPACE.")
                 else:
-                    print(
-                        "\n❌ Ingen kalibreringspunkter fundet."
-                        "\n   Sørg for at dartskiven er synlig og prøv igen med SPACE."
-                    )
+                    print("\n❌ Ingen kalibreringspunkter fundet — sørg for at skiven er synlig.")
 
-            # Build preview frame
+            # --- Snapshot scoring ---
+            if self._snapshot_requested and self._homography is not None:
+                self._snapshot_requested = False
+                self._score_snapshot(frame, detection)
+
+            # --- Build preview ---
             if self._show_preview:
-                preview = (
-                    detection.annotated_frame.copy()
-                    if detection.annotated_frame is not None
-                    else frame.copy()
-                )
+                self._build_preview(frame, detection)
 
-                h, w = preview.shape[:2]
+    def _score_snapshot(self, frame: np.ndarray, detection) -> None:
+        """Score only the darts that weren't scored in the previous snapshot."""
+        if not detection.dart_tips:
+            print("\n⚠️  Ingen pile fundet i billedet — prøv igen.")
+            return
 
-                # --- Calibration status (top left) ---
-                cal_count = len(detection.cal_points)
-                if self._homography is not None:
-                    cal_text = f"Cal: OK [{self._homography_source}]"
-                    cal_color = (0, 255, 0)
-                else:
-                    cal_text = f"Cal: {cal_count}/4 — SPACE for at kalibrere"
-                    cal_color = (0, 165, 255) if cal_count > 0 else (0, 0, 255)
+        # Score all currently visible darts
+        all_results = self._scorer.score_detections_with_homography(
+            detection.dart_tips,
+            self._homography,
+            [1.0] * len(detection.dart_tips),
+        )
 
-                cv2.putText(preview, cal_text, (10, 32),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, cal_color, 2)
-
-                # --- Score overlay (top right) ---
-                with self._overlay_lock:
-                    overlay = self._score_overlay
-
-                if overlay.player_name:
-                    # Player name
-                    name_text = overlay.player_name
-                    (tw, _), _ = cv2.getTextSize(name_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                    cv2.putText(preview, name_text, (w - tw - 10, 32),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-
-                    # Score remaining
-                    score_text = f"{overlay.score_remaining} tilbage"
-                    (tw, _), _ = cv2.getTextSize(score_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2)
-                    cv2.putText(preview, score_text, (w - tw - 10, 72),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
-
-                    # This hand
-                    if overlay.hand_scores:
-                        hand_text = "  +  ".join(overlay.hand_scores)
-                        if overlay.hand_total > 0:
-                            hand_text += f"  =  {overlay.hand_total}"
-                        (tw, _), _ = cv2.getTextSize(hand_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-                        cv2.putText(preview, hand_text, (w - tw - 10, 108),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 100), 2)
-
-                # --- Bottom instruction ---
-                cv2.putText(preview, "SPACE = kalibrer  |  Q = afslut",
-                            (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-
-                with self._preview_lock:
-                    self._latest_preview = preview
-
-            # Skip scoring until calibrated
-            if self._homography is None:
-                continue
-
-            # FIFO debounce
-            stable_tips = self._fifo_filter(detection.dart_tips)
-            stable_confs = [1.0] * len(stable_tips)
-
-            results = self._scorer.score_detections_with_homography(
-                stable_tips, self._homography, stable_confs,
+        # Find which tips are NEW (not already in _scored_tips)
+        new_results: list[ScoreResult] = []
+        for result in all_results:
+            tip = (result.pixel_x, result.pixel_y)
+            already_scored = any(
+                math.hypot(tip[0] - prev[0], tip[1] - prev[1]) < self.MATCH_TOLERANCE
+                for prev in self._scored_tips
             )
+            if not already_scored:
+                new_results.append(result)
+                self._scored_tips.append(tip)
 
-            dart_count = len(results)
+        if not new_results:
+            print("\n⚠️  Ingen nye pile siden sidste snapshot — er pilen landet?")
+            return
 
-            if dart_count != self._last_dart_count:
-                if dart_count == self._pending_count:
-                    self._debounce_counter += 1
-                else:
-                    self._pending_count = dart_count
-                    self._pending_results = results
-                    self._debounce_counter = 1
+        event = ScoreEvent(
+            results=new_results,
+            dart_count=len(detection.dart_tips),
+            homography_source=self._homography_source,
+            frame=frame.copy() if self._show_preview else None,
+        )
+        self._callback(event)
 
-                if self._debounce_counter >= self.DEBOUNCE_FRAMES:
-                    if dart_count > self._last_dart_count:
-                        event = ScoreEvent(
-                            results=self._pending_results,
-                            dart_count=dart_count,
-                            homography_source=self._homography_source,
-                            frame=frame.copy() if self._show_preview else None,
-                        )
-                        self._callback(event)
-                    self._last_dart_count = dart_count
-                    self._debounce_counter = 0
+    def _build_preview(self, frame: np.ndarray, detection) -> None:
+        """Build the annotated preview frame for display."""
+        preview = (
+            detection.annotated_frame.copy()
+            if detection.annotated_frame is not None
+            else frame.copy()
+        )
 
-    # ------------------------------------------------------------------
-    # FIFO debounce filter
-    # ------------------------------------------------------------------
+        h, w = preview.shape[:2]
 
-    def _fifo_filter(self, tips: list[tuple[float, float]]) -> list[tuple[float, float]]:
-        """Return only dart tips stable across the FIFO window."""
-        self._dart_fifo.append(tips)
+        # --- Top left: calibration + instruction ---
+        cal_count = len(detection.cal_points)
+        if self._homography is not None:
+            cal_text = f"Cal: OK [{self._homography_source}]"
+            cal_color = (0, 255, 0)
+            instruction = "SPACE = score pil  |  C = kalibrér  |  Q = afslut"
+        else:
+            cal_text = f"Cal: {cal_count}/4 — SPACE for at kalibrere"
+            cal_color = (0, 165, 255) if cal_count > 0 else (0, 0, 255)
+            instruction = "SPACE = kalibrér  |  Q = afslut"
 
-        if len(self._dart_fifo) < self.FIFO_MIN_HITS:
-            return []
+        cv2.putText(preview, cal_text, (10, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, cal_color, 2)
 
-        stable: list[tuple[float, float]] = []
-        for tip in tips:
-            hit_count = sum(
-                any(
-                    math.hypot(tip[0] - t[0], tip[1] - t[1]) < self.FIFO_TOLERANCE
-                    for t in frame_tips
-                )
-                for frame_tips in self._dart_fifo
-            )
-            if hit_count >= self.FIFO_MIN_HITS:
-                stable.append(tip)
+        # --- Top right: score overlay ---
+        with self._overlay_lock:
+            overlay = self._score_overlay
 
-        return stable
+        if overlay.player_name:
+            (tw, _), _ = cv2.getTextSize(overlay.player_name, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.putText(preview, overlay.player_name, (w - tw - 10, 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            score_text = f"{overlay.score_remaining} tilbage"
+            (tw, _), _ = cv2.getTextSize(score_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2)
+            cv2.putText(preview, score_text, (w - tw - 10, 72),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
+
+            if overlay.hand_scores:
+                hand_text = "  +  ".join(overlay.hand_scores)
+                if overlay.hand_total > 0:
+                    hand_text += f"  =  {overlay.hand_total}"
+                (tw, _), _ = cv2.getTextSize(hand_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                cv2.putText(preview, hand_text, (w - tw - 10, 108),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 100), 2)
+
+        # --- Bottom: instruction ---
+        cv2.putText(preview, instruction,
+                    (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+        with self._preview_lock:
+            self._latest_preview = preview
