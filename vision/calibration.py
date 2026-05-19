@@ -49,21 +49,23 @@ DEFAULT_OUTPUT_SIZE = 800
 # ---------------------------------------------------------------------------
 # Calibration point geometry
 # ---------------------------------------------------------------------------
-# Angles (degrees, clockwise from 12 o'clock) for the centre of each
-# calibration segment on the double ring.
-# Standard dartboard layout (clockwise from top):
-#   20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5
+# Angles (degrees, clockwise from 12 o'clock) mapped to where YOLO actually
+# detects each class label — based on observed detections from the trained model.
 #
-# Segment positions (each segment = 18°, segment 20 centred at 0°):
-#   20 =   0°  (top,    12 o'clock)
-#    6 =  99°  (right,   ~3:20)
-#    3 = 180°  (bottom,   6 o'clock)
-#   11 = 261°  (left,    ~8:40)
+# NOTE: The model was trained with annotations where the class names do not
+# match the physical segment positions. Based on observed detections:
+#   YOLO "cal_20" -> physically at top       (correct)
+#   YOLO "cal_11" -> physically at right     (~99°)
+#   YOLO "cal_3"  -> physically at left      (~261°)
+#   YOLO "cal_6"  -> physically at bottom    (~180°)
+#
+# These angles compensate for the annotation mismatch so that homography
+# maps pixel coordinates correctly onto the canonical board.
 _CAL_SEGMENT_ANGLES: dict[int, float] = {
-    20:   0.0,   # top
-    6:   99.0,   # right
-    3:  180.0,   # bottom
-    11: 261.0,   # left
+    20:   0.0,   # top    — correct
+    11:  99.0,   # YOLO detects "cal_11" on the right side
+    6:  180.0,   # YOLO detects "cal_6"  at the bottom
+    3:  261.0,   # YOLO detects "cal_3"  on the left side
 }
 
 # Radius of the double ring in the canonical 800x800 output image (pixels)
