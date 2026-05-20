@@ -30,6 +30,7 @@ Class mapping (must match Roboflow export order):
 """
 
 import argparse
+import random
 import shutil
 import sys
 from pathlib import Path
@@ -62,10 +63,24 @@ def check_own_images() -> bool:
     return False
 
 
-def build_own_only_dataset() -> Path:
-    """Build a dataset from own images only — 80% train, 20% val."""
-    import random
+def valid_pairs(img_dir: Path, lbl_dir: Path) -> list[tuple[Path, Path]]:
+    """Return only (image, label) pairs where BOTH files exist."""
+    pairs = []
+    for img in img_dir.iterdir():
+        if img.suffix not in IMAGE_EXTENSIONS:
+            continue
+        lbl = lbl_dir / img.with_suffix(".txt").name
+        if lbl.exists():
+            pairs.append((img, lbl))
+    return pairs
 
+
+def build_own_only_dataset() -> Path:
+    """Build a dataset from own images only — 80% train, 20% val.
+
+    Only copies pairs where BOTH image and label file exist, preventing
+    FileNotFoundError during training.
+    """
     out = MERGED_DIR
     if out.exists():
         shutil.rmtree(out)
@@ -75,20 +90,21 @@ def build_own_only_dataset() -> Path:
 
     own_imgs = OWN_DIR / "images"
     own_lbls = OWN_DIR / "labels"
-    all_imgs = [f for f in own_imgs.iterdir() if f.suffix in IMAGE_EXTENSIONS]
-    random.shuffle(all_imgs)
-    split_idx = int(len(all_imgs) * 0.8)
-    train_imgs = all_imgs[:split_idx]
-    val_imgs = all_imgs[split_idx:]
 
-    for split, imgs in [("train", train_imgs), ("val", val_imgs)]:
-        for img in imgs:
+    pairs = valid_pairs(own_imgs, own_lbls)
+    print(f"Valid image+label pairs: {len(pairs)}")
+
+    random.shuffle(pairs)
+    split_idx = int(len(pairs) * 0.8)
+    train_pairs = pairs[:split_idx]
+    val_pairs = pairs[split_idx:]
+
+    for split, split_pairs in [("train", train_pairs), ("val", val_pairs)]:
+        for img, lbl in split_pairs:
             shutil.copy2(img, out / "images" / split / img.name)
-            lbl = own_lbls / img.with_suffix(".txt").name
-            if lbl.exists():
-                shutil.copy2(lbl, out / "labels" / split / lbl.name)
+            shutil.copy2(lbl, out / "labels" / split / lbl.name)
 
-    print(f"Own-only dataset: {len(train_imgs)} train, {len(val_imgs)} val")
+    print(f"Own-only dataset: {len(train_pairs)} train, {len(val_pairs)} val")
 
     yaml = f"""# Own images only dataset
 path: {out.absolute()}
@@ -122,14 +138,10 @@ def merge_datasets(use_own: bool) -> Path:
         src_lbls = MCNALLY_DIR / "labels" / split
         if not src_imgs.exists():
             continue
-        for img in src_imgs.iterdir():
-            if img.suffix not in IMAGE_EXTENSIONS:
-                continue
+        for img, lbl in valid_pairs(src_imgs, src_lbls):
             shutil.copy2(img, MERGED_DIR / "images" / split / img.name)
-            lbl = src_lbls / img.with_suffix(".txt").name
-            if lbl.exists():
-                shutil.copy2(lbl, MERGED_DIR / "labels" / split / lbl.name)
-                total_mcnally += 1
+            shutil.copy2(lbl, MERGED_DIR / "labels" / split / lbl.name)
+            total_mcnally += 1
 
     print(f"McNally images copied: {total_mcnally}")
 
@@ -137,15 +149,11 @@ def merge_datasets(use_own: bool) -> Path:
     if use_own:
         own_imgs = OWN_DIR / "images"
         own_lbls = OWN_DIR / "labels"
-        for img in own_imgs.iterdir():
-            if img.suffix not in IMAGE_EXTENSIONS:
-                continue
+        for img, lbl in valid_pairs(own_imgs, own_lbls):
             dst_name = f"own_{img.name}"
             shutil.copy2(img, MERGED_DIR / "images" / "train" / dst_name)
-            lbl = own_lbls / img.with_suffix(".txt").name
-            if lbl.exists():
-                shutil.copy2(lbl, MERGED_DIR / "labels" / "train" / f"own_{lbl.name}")
-                total_own += 1
+            shutil.copy2(lbl, MERGED_DIR / "labels" / "train" / f"own_{lbl.name}")
+            total_own += 1
         print(f"Own images added to train: {total_own}")
 
     yaml = f"""# Merged dataset: McNally ({total_mcnally}) + own ({total_own})
