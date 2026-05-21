@@ -9,19 +9,19 @@ __pycache__/
 .env
 .env.local
 
-# ML models
+# ML models — keep base model, ignore trained weights
 *.pt
 *.pth
 *.onnx
 runs/
 wandb/
 
-# Dataset — exclude large image/label folders
-dataset/yolo/images/
-dataset/yolo/labels/
-dataset/cropped_images/
-dataset/images/
-dataset/my_board/
+# Homography cache files
+*.npy
+*.cache
+
+# Dataset — large files never committed
+dataset/
 
 # macOS
 .DS_Store
@@ -34,10 +34,12 @@ dist/
 logs/
 *.log
 
-# Calibration
+# Calibration artefacts
 calibration.json
+config/homography.npy
+config/homography.json
 
-# Debug images
+# Debug images produced at runtime
 debug_roi.jpg
 detection_debug.jpg
 roi_for_calibration.jpg
