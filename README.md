@@ -1,13 +1,13 @@
 # dart-ai
 
-AI-drevet dartscoring til 301 — kameraet er en iPhone, detektionen kører lokalt på Apple Silicon.
+AI-drevet dartscoring til 501 — kameraet er en iPhone, detektionen kører lokalt på Apple Silicon.
 
 ## Hvordan det virker
 
-Et YOLOv11-model kører live på kamerastrømmen og detekterer fem klasser: selve dartpilen (`dart`) og fire kalibreringspunkter på dobbeltringen (`cal_20`, `cal_6`, `cal_3`, `cal_11`). De fire kalibreringspunkter bruges til at beregne en homografi der folder skivens perspektiv ud til et kanonisk top-down-billede. Pile-koordinater mappes derefter til skivens geometri og scores i 301-spillet.
+Et YOLOv11-model kører live på kamerastrømmen og detekterer fem klasser: selve dartpilen (`dart`) og fire kalibreringspunkter på dobbeltringen (`cal_20`, `cal_6`, `cal_3`, `cal_11`). De fire kalibreringspunkter bruges til at beregne en homografi der folder skivens perspektiv ud til et kanonisk top-down-billede. Pile-koordinater mappes derefter til skivens geometri og scores i 501-spillet.
 
 ```
-Kamerastrøm → YOLO-detektion → Homografi-beregning → Score-beregning → 301-spilmotor
+Kamerastrøm → YOLO-detektion → Homografi-beregning → Score-beregning → 501-spilmotor
 ```
 
 ## Hardwarekrav
@@ -177,14 +177,14 @@ uv run python scripts/test_detector.py --random
 
 ```bash
 # Ét-spiller spil
-uv run python scripts/play_301.py
+uv run python scripts/play_501.py
 
 # Flerspiller
-uv run python scripts/play_301.py --players "Alice" "Bob"
-uv run python scripts/play_301.py --players "Alice" "Bob" "Charlie" "Dave"
+uv run python scripts/play_501.py --players "Alice" "Bob"
+uv run python scripts/play_501.py --players "Alice" "Bob" "Charlie" "Dave"
 
 # Uden live preview (headless)
-uv run python scripts/play_301.py --no-preview
+uv run python scripts/play_501.py --no-preview
 ```
 
 ### Tastatur-kommandoer
@@ -209,7 +209,7 @@ uv run python scripts/play_301.py --no-preview
 
 ### Spil-workflow
 
-1. Start `play_301.py` — kamera og model indlæses
+1. Start `play_501.py` — kamera og model indlæses
 2. Sørg for at hele dartskiven er synlig i kamera-vinduet
 3. Tryk `K` (eller `SPACE`) for at kalibrere — vent på `✅ Kalibrering lykkedes!` i terminalen
 4. Kast en pil → tryk `SPACE` → scoren vises
@@ -232,7 +232,7 @@ Det åbner et interaktivt vindue. Klik i rækkefølge: dobbelt-20 (top) → dobb
 dart-ai/
 ├── backend/                  # Spilmotor og (fremtidig) API
 │   ├── game/
-│   │   ├── game_301.py       # 301-spilregler og -logik
+│   │   ├── game_501.py       # 501-spilregler og -logik
 │   │   ├── models.py         # Dataklasser (Player, Turn, osv.)
 │   │   └── session.py        # Spilsession — binder kamera + spil sammen
 │   └── api/                  # FastAPI-routes (ikke i aktiv brug)
@@ -250,13 +250,13 @@ dart-ai/
 ├── models/                   # YOLO-modelfiler (.pt) — committes ikke
 │   └── .gitkeep
 ├── scripts/                  # Kørselsscripts
-│   ├── play_301.py           # ← Start her for at spille
+│   ├── play_501.py           # ← Start her for at spille
 │   ├── train_5class.py       # Træn 5-klasse-modellen
 │   ├── convert_dataset_5class.py  # Konvertér McNally-datasæt
 │   ├── run_calibration.py    # Manuel kalibrering
 │   ├── run_stream.py         # Rå kamerastrøm til debugging
 │   ├── test_detector.py      # Test YOLO-detektionen på billeder
-│   └── test_game_301.py      # Unittest for spillogikken
+│   └── test_game_501.py      # Unittest for spillogikken
 ├── utils/
 │   ├── geometry.py           # Koordinat-transformationer
 │   └── logging.py            # Struktureret logging via structlog
@@ -273,10 +273,10 @@ dart-ai/
 
 ## Kendte begrænsninger
 
-- **macOS-only:** OpenCV-vinduer skal køres på main-tråden på macOS — `play_301.py` er struktureret derefter og virker ikke uændret på Linux/Windows.
+- **macOS-only:** OpenCV-vinduer skal køres på main-tråden på macOS — `play_501.py` er struktureret derefter og virker ikke uændret på Linux/Windows.
 - **Homografi kræver 4 kalibreringspunkter:** Modellen skal detektere alle fire `cal_*`-klasser i samme frame for at beregne homografien. Hvis lyset er dårligt eller skiven er delvist skjult, falder kalibreringen tilbage til en gemt `config/homography.npy` (hvis den findes).
 - **McNally-datasæt:** Der er en kendt annotation-uoverensstemmelse i McNally-datasættet — `cal_6` og `cal_11` er ombyttet i forhold til fysisk position. `vision/calibration.py` kompenserer med justerede vinkler. Egne annotationer bør følge det faktiske segment.
-- **Database/API:** `backend/api/`, `database/` og `alembic.ini` er scaffolding til en fremtidig web-frontend — de bruges ikke af `play_301.py`.
+- **Database/API:** `backend/api/`, `database/` og `alembic.ini` er scaffolding til en fremtidig web-frontend — de bruges ikke af `play_501.py`.
 - **Én model, ét kamera-setup:** Modellen er specifik for dit kamera-afstand og -vinkel. Ændrer du opstillingen markant, bør du genoptage og gettræne.
 
 ## Fejlfinding
