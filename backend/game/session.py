@@ -1,8 +1,8 @@
-"""Game session — bridges DartPipeline events to Game301 logic."""
+"""Game session — bridges DartPipeline events to Game501 logic."""
 
 from __future__ import annotations
 
-from backend.game.game_301 import Game301, ThrowResult
+from backend.game.game_501 import Game501, ThrowResult
 from backend.game.models import GameStatus
 from utils.logging import get_logger
 from vision.pipeline import DartPipeline, ScoreEvent, ScoreOverlay
@@ -11,7 +11,7 @@ logger = get_logger(__name__)
 
 
 class GameSession:
-    """Manages a single 301 game session with live dart detection."""
+    """Manages a single 501 game session with live dart detection."""
 
     def __init__(
         self,
@@ -20,7 +20,7 @@ class GameSession:
         show_preview: bool = True,
         on_throw: callable = None,
     ) -> None:
-        self._game = Game301(player_names=player_names)
+        self._game = Game501(player_names=player_names)
         self._on_throw = on_throw
         self._pipeline = DartPipeline(
             on_score_callback=self._on_score_event,
@@ -63,7 +63,7 @@ class GameSession:
         return self._pipeline.tick_preview()
 
     @property
-    def game(self) -> Game301:
+    def game(self) -> Game501:
         return self._game
 
     @property
